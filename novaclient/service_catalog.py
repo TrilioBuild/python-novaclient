@@ -87,3 +87,14 @@ class ServiceCatalog(object):
                 endpoints=matching_endpoints)
         else:
             return matching_endpoints[0][endpoint_type]
+
+    def url_for_v3(self, attr=None, filter_value=None,
+                service_type=None, endpoint_type='publicURL',
+                service_name=None):
+
+        endpoint_list = self.catalog['token']['catalog']
+        for endpoint in endpoint_list:
+            if endpoint['type'] == service_type:
+               for ed in endpoint['endpoints']:
+                   if ed['interface'] == 'public':
+                      return ed['url']
