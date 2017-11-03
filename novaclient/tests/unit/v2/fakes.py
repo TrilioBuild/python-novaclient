@@ -17,23 +17,51 @@
 import datetime
 
 import mock
-from oslo.utils import strutils
+from oslo_utils import strutils
+import re
 import six
 from six.moves.urllib import parse
 
+import novaclient
+from novaclient import api_versions
 from novaclient import client as base_client
 from novaclient import exceptions
 from novaclient.tests.unit import fakes
 from novaclient.tests.unit import utils
 from novaclient.v2 import client
 
+# regex to compare callback to result of get_endpoint()
+# checks version number (vX or vX.X where X is a number)
+# and also checks if the id is on the end
+ENDPOINT_RE = re.compile(
+    r"^get_http:__nova_api:8774_v\d(_\d)?_\w{32}$")
+
+# accepts formats like v2 or v2.1
+ENDPOINT_TYPE_RE = re.compile(r"^v\d(\.\d)?$")
+
+# accepts formats like v2 or v2_1
+CALLBACK_RE = re.compile(r"^get_http:__nova_api:8774_v\d(_\d)?$")
+
+# fake image uuids
+FAKE_IMAGE_UUID_1 = 'c99d7632-bd66-4be9-aed5-3dd14b223a76'
+FAKE_IMAGE_UUID_2 = 'f27f479a-ddda-419a-9bbc-d6b56b210161'
+FAKE_IMAGE_UUID_SNAPSHOT = '555cae93-fb41-4145-9c52-f5b923538a26'
+FAKE_IMAGE_UUID_SNAP_DEL = '55bb23af-97a4-4068-bdf8-f10c62880ddf'
+
+# fake request id
+FAKE_REQUEST_ID = fakes.FAKE_REQUEST_ID
+FAKE_REQUEST_ID_LIST = fakes.FAKE_REQUEST_ID_LIST
+FAKE_RESPONSE_HEADERS = {'x-openstack-request-id': FAKE_REQUEST_ID}
+
 
 class FakeClient(fakes.FakeClient, client.Client):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, api_version, *args, **kwargs):
         client.Client.__init__(self, 'username', 'password',
                                'project_id', 'auth_url',
-                               extensions=kwargs.get('extensions'))
+                               extensions=kwargs.get('extensions'),
+                               direct_use=False)
+        kwargs["api_version"] = api_version
         self.client = FakeHTTPClient(**kwargs)
 
 
@@ -48,7 +76,15 @@ class FakeHTTPClient(base_client.HTTPClient):
         self.projectid = 'projectid'
         self.user = 'user'
         self.region_name = 'region_name'
-        self.endpoint_type = 'endpoint_type'
+
+        # determines which endpoint to return in get_endpoint()
+        # NOTE(augustina): this is a hacky workaround, ultimately
+        # we need to fix our whole mocking architecture (fixtures?)
+        if 'endpoint_type' in kwargs:
+            self.endpoint_type = kwargs['endpoint_type']
+        else:
+            self.endpoint_type = 'endpoint_type'
+
         self.service_type = 'service_type'
         self.service_name = 'service_name'
         self.volume_service_name = 'volume_service_name'
@@ -56,6 +92,9 @@ class FakeHTTPClient(base_client.HTTPClient):
         self.bypass_url = 'bypass_url'
         self.os_cache = 'os_cache'
         self.http_log_debug = 'http_log_debug'
+        self.last_request_id = None
+        self.management_url = self.get_endpoint()
+        self.api_version = kwargs.get("api_version")
 
     def _cs_request(self, url, method, **kwargs):
         # Check that certain things are called correctly
@@ -64,15 +103,37 @@ class FakeHTTPClient(base_client.HTTPClient):
         elif method == 'PUT':
             assert 'body' in kwargs
 
-        # Call the method
-        args = parse.parse_qsl(parse.urlparse(url)[4])
-        kwargs.update(args)
-        munged_url = url.rsplit('?', 1)[0]
-        munged_url = munged_url.strip('/').replace('/', '_').replace('.', '_')
-        munged_url = munged_url.replace('-', '_')
-        munged_url = munged_url.replace(' ', '_')
+        if url is not None:
+            # Call the method
+            args = parse.parse_qsl(parse.urlparse(url)[4])
+            kwargs.update(args)
+            munged_url = url.rsplit('?', 1)[0]
+            munged_url = munged_url.strip('/').replace('/', '_')
+            munged_url = munged_url.replace('.', '_')
+            munged_url = munged_url.replace('-', '_')
+            munged_url = munged_url.replace(' ', '_')
+            munged_url = munged_url.replace('!', '_')
+            munged_url = munged_url.replace('@', '_')
+            callback = "%s_%s" % (method.lower(), munged_url)
 
-        callback = "%s_%s" % (method.lower(), munged_url)
+        if url is None or callback == "get_http:__nova_api:8774":
+            # To get API version information, it is necessary to GET
+            # a nova endpoint directly without "v2/<tenant-id>".
+            callback = "get_versions"
+        elif CALLBACK_RE.search(callback):
+            callback = "get_current_version"
+        elif ENDPOINT_RE.search(callback):
+            # compare callback to result of get_endpoint()
+            # NOTE(sdague): if we try to call a thing that doesn't
+            # exist, just return a 404. This allows the stack to act
+            # more like we'd expect when making REST calls.
+            raise exceptions.NotFound('404')
+
+        # Handle fake glance v2 requests
+        v2_image = False
+        if callback.startswith('get_v2_images'):
+            v2_image = True
+            callback = callback.replace('get_v2_', 'get_')
 
         if not hasattr(self, callback):
             raise AssertionError('Called unknown API method: %s %s, '
@@ -83,12 +144,87 @@ class FakeHTTPClient(base_client.HTTPClient):
         self.callstack.append((method, url, kwargs.get('body')))
 
         status, headers, body = getattr(self, callback)(**kwargs)
+
+        # If we're dealing with a glance v2 image response, the response
+        # isn't wrapped like the compute images API proxy is, so handle that.
+        if body and v2_image and 'image' in body:
+            body = body['image']
+
         r = utils.TestResponse({
             "status_code": status,
             "text": body,
             "headers": headers,
         })
         return r, body
+
+    def get_endpoint(self, **kwargs):
+        # check if endpoint matches expected format (eg, v2.1)
+        if (hasattr(self, 'endpoint_type') and
+                ENDPOINT_TYPE_RE.search(self.endpoint_type)):
+            return "http://nova-api:8774/%s/" % self.endpoint_type
+        else:
+            return (
+                "http://nova-api:8774/v2.1/190a755eef2e4aac9f06aa6be9786385")
+
+    def get_versions(self):
+        return (200, FAKE_RESPONSE_HEADERS, {
+            "versions": [
+                {"status": "SUPPORTED", "updated": "2011-01-21T11:33:21Z",
+                 "links": [{"href": "http://nova-api:8774/v2/",
+                            "rel": "self"}],
+                 "min_version": "",
+                 "version": "",
+                 "id": "v2.0"},
+                {"status": "CURRENT", "updated": "2013-07-23T11:33:21Z",
+                 "links": [{"href": "http://nova-api:8774/v2.1/",
+                            "rel": "self"}],
+                 "min_version": novaclient.API_MIN_VERSION.get_string(),
+                 "version": novaclient.API_MAX_VERSION.get_string(),
+                 "id": "v2.1"}
+            ]})
+
+    def get_current_version(self):
+        versions = {
+            # v2 doesn't contain version or min_version fields
+            "v2": {
+                "version": {
+                    "status": "SUPPORTED",
+                    "updated": "2011-01-21T11:33:21Z",
+                    "links": [{
+                        "href": "http://nova-api:8774/v2/",
+                        "rel": "self"
+                    }],
+                    "id": "v2.0"
+                }
+            },
+            "v2.1": {
+                "version": {
+                    "status": "CURRENT",
+                    "updated": "2013-07-23T11:33:21Z",
+                    "links": [{
+                        "href": "http://nova-api:8774/v2.1/",
+                        "rel": "self"
+                    }],
+                    "min_version": novaclient.API_MIN_VERSION.get_string(),
+                    "version": novaclient.API_MAX_VERSION.get_string(),
+                    "id": "v2.1"
+                }
+            }
+        }
+
+        # if an endpoint_type that matches a version wasn't initialized,
+        #  default to v2.1
+        endpoint = 'v2.1'
+
+        if hasattr(self, 'endpoint_type'):
+            if ENDPOINT_TYPE_RE.search(self.endpoint_type):
+                if self.endpoint_type in versions:
+                    endpoint = self.endpoint_type
+                else:
+                    raise AssertionError(
+                        "Unknown endpoint_type:%s" % self.endpoint_type)
+
+        return (200, FAKE_RESPONSE_HEADERS, versions[endpoint])
 
     #
     # agents
@@ -176,7 +312,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                 "updated": "2011-11-03T00:00:00+00:00"
             },
         ]
-        return (200, {}, {
+        return (200, FAKE_RESPONSE_HEADERS, {
             "extensions": exts,
         })
 
@@ -253,12 +389,12 @@ class FakeHTTPClient(base_client.HTTPClient):
                 "id": 1234,
                 "name": "sample-server",
                 "image": {
-                    "id": 2,
+                    "id": FAKE_IMAGE_UUID_2,
                     "name": "sample image",
                 },
                 "flavor": {
                     "id": 1,
-                    "name": "256 mb server",
+                    "name": "256 MB Server",
                 },
                 "hostId": "e4d909c290d0fb1ca068ffaddf22cbd0",
                 "status": "BUILD",
@@ -294,12 +430,12 @@ class FakeHTTPClient(base_client.HTTPClient):
                 "id": 5678,
                 "name": "sample-server2",
                 "image": {
-                    "id": 2,
+                    "id": FAKE_IMAGE_UUID_1,
                     "name": "sample image",
                 },
                 "flavor": {
                     "id": 1,
-                    "name": "256 mb server",
+                    "name": "256 MB Server",
                 },
                 "hostId": "9e107d9d372bb6826bd81d3542a419d6",
                 "status": "ACTIVE",
@@ -340,7 +476,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                 "image": "",
                 "flavor": {
                     "id": 1,
-                    "name": "256 mb server",
+                    "name": "256 MB Server",
                 },
                 "hostId": "9e107d9d372bb6826bd81d3542a419d6",
                 "status": "ACTIVE",
@@ -362,7 +498,19 @@ class FakeHTTPClient(base_client.HTTPClient):
                 "metadata": {
                     "Server Label": "DB 1"
                 }
-            }
+            },
+            {
+                "id": 9013,
+                "name": "sample-server4",
+                "flavor": {
+                    "id": '80645cf4-6ad3-410a-bbc8-6f3e1e291f51',
+                },
+                "image": {
+                    "id": '3e861307-73a6-4d1f-8d68-f68b03223032',
+                },
+                "hostId": "9e107d9d372bb6826bd81d3542a419d6",
+                "status": "ACTIVE",
+            },
         ]})
 
     def post_servers(self, body, **kw):
@@ -414,6 +562,10 @@ class FakeHTTPClient(base_client.HTTPClient):
 
     def get_servers_9012(self, **kw):
         r = {'server': self.get_servers_detail()[2]['servers'][2]}
+        return (200, {}, r)
+
+    def get_servers_9013(self, **kw):
+        r = {'server': self.get_servers_detail()[2]['servers'][3]}
         return (200, {}, r)
 
     def put_servers_1234(self, body, **kw):
@@ -486,29 +638,6 @@ class FakeHTTPClient(base_client.HTTPClient):
         })
 
     #
-    # Server Addresses
-    #
-
-    def get_servers_1234_ips(self, **kw):
-        return (200, {}, {
-            'addresses':
-            self.get_servers_1234()[1]['server']['addresses']})
-
-    def get_servers_1234_ips_public(self, **kw):
-        return (200, {}, {
-            'public':
-            self.get_servers_1234_ips()[1]['addresses']['public']})
-
-    def get_servers_1234_ips_private(self, **kw):
-        return (
-            200, {},
-            {'private':
-                self.get_servers_1234_ips()[1]['addresses']['private']})
-
-    def delete_servers_1234_ips_public_1_2_3_4(self, **kw):
-        return (202, {}, None)
-
-    #
     # Server password
     #
 
@@ -570,9 +699,6 @@ class FakeHTTPClient(base_client.HTTPClient):
             assert list(body[action]) == ['adminPass']
         elif action in cls.type_actions:
             assert list(body[action]) == ['type']
-        elif action == 'os-migrateLive':
-            assert set(body[action].keys()) == set(['host', 'block_migration',
-                                                    'disk_over_commit'])
         elif action == 'os-resetState':
             assert list(body[action]) == ['state']
         elif action == 'resetNetwork':
@@ -582,12 +708,14 @@ class FakeHTTPClient(base_client.HTTPClient):
         elif action == 'createBackup':
             assert set(body[action]) == set(['name', 'backup_type',
                                              'rotation'])
+        elif action == 'trigger_crash_dump':
+            assert body[action] is None
         else:
             return False
         return True
 
     def post_servers_1234_action(self, body, **kw):
-        _headers = None
+        _headers = dict()
         _body = None
         resp = 202
         assert len(body.keys()) == 1
@@ -599,6 +727,15 @@ class FakeHTTPClient(base_client.HTTPClient):
             # if we found 'action' in method check_server_actions and
             # raise AssertionError if we didn't find 'action' at all.
             pass
+        elif action == 'os-migrateLive':
+            expected = set(['host', 'block_migration'])
+            if self.api_version >= api_versions.APIVersion("2.30"):
+                if 'force' in body[action].keys():
+                    # force can be optional
+                    expected.add('force')
+            if self.api_version < api_versions.APIVersion("2.25"):
+                expected.add('disk_over_commit')
+            assert set(body[action].keys()) == expected
         elif action == 'rebuild':
             body = body[action]
             adminPass = body.get('adminPass', 'randompassword')
@@ -618,7 +755,11 @@ class FakeHTTPClient(base_client.HTTPClient):
             _body = {'adminPass': 'RescuePassword'}
         elif action == 'createImage':
             assert set(body[action].keys()) == set(['name', 'metadata'])
-            _headers = dict(location="http://blah/images/456")
+            _headers = dict(location="http://blah/images/%s" %
+                            FAKE_IMAGE_UUID_SNAPSHOT)
+            if body[action]['name'] == 'mysnapshot_deleted':
+                _headers = dict(location="http://blah/images/%s" %
+                                FAKE_IMAGE_UUID_SNAP_DEL)
         elif action == 'os-getConsoleOutput':
             assert list(body[action]) == ['length']
             return (202, {}, {'output': 'foo'})
@@ -628,9 +769,14 @@ class FakeHTTPClient(base_client.HTTPClient):
                 keys.remove('adminPass')
             if 'host' in keys:
                 keys.remove('host')
-            assert set(keys) == set(['onSharedStorage'])
+            if 'onSharedStorage' in keys:
+                keys.remove('onSharedStorage')
+            if 'force' in keys:
+                keys.remove('force')
+            assert set(keys) == set()
         else:
             raise AssertionError("Unexpected server action: %s" % action)
+        _headers.update(FAKE_RESPONSE_HEADERS)
         return (resp, _headers, _body)
 
     def post_servers_5678_action(self, body, **kw):
@@ -668,23 +814,23 @@ class FakeHTTPClient(base_client.HTTPClient):
                 if k not in ['id', 'name']:
                     del flavor[k]
 
-        return (200, {}, flavors)
+        return (200, FAKE_RESPONSE_HEADERS, flavors)
 
     def get_flavors_detail(self, **kw):
         flavors = {'flavors': [
-            {'id': 1, 'name': '256 mb server', 'ram': 256, 'disk': 10,
+            {'id': 1, 'name': '256 MB Server', 'ram': 256, 'disk': 10,
              'OS-FLV-EXT-DATA:ephemeral': 10,
              'os-flavor-access:is_public': True,
              'links': {}},
-            {'id': 2, 'name': '512 mb server', 'ram': 512, 'disk': 20,
+            {'id': 2, 'name': '512 MB Server', 'ram': 512, 'disk': 20,
              'OS-FLV-EXT-DATA:ephemeral': 20,
              'os-flavor-access:is_public': False,
              'links': {}},
-            {'id': 4, 'name': '1024 mb server', 'ram': 1024, 'disk': 10,
+            {'id': 4, 'name': '1024 MB Server', 'ram': 1024, 'disk': 10,
              'OS-FLV-EXT-DATA:ephemeral': 10,
              'os-flavor-access:is_public': True,
              'links': {}},
-            {'id': 'aa1', 'name': '128 mb server', 'ram': 128, 'disk': 0,
+            {'id': 'aa1', 'name': '128 MB Server', 'ram': 128, 'disk': 0,
              'OS-FLV-EXT-DATA:ephemeral': 0,
              'os-flavor-access:is_public': True,
              'links': {}}
@@ -711,12 +857,12 @@ class FakeHTTPClient(base_client.HTTPClient):
                     if not v['os-flavor-access:is_public']
                 ]
 
-        return (200, {}, flavors)
+        return (200, FAKE_RESPONSE_HEADERS, flavors)
 
     def get_flavors_1(self, **kw):
         return (
             200,
-            {},
+            FAKE_RESPONSE_HEADERS,
             {'flavor':
                 self.get_flavors_detail(is_public='None')[2]['flavors'][0]}
         )
@@ -733,26 +879,29 @@ class FakeHTTPClient(base_client.HTTPClient):
         # Diablo has no ephemeral
         return (
             200,
-            {},
+            FAKE_RESPONSE_HEADERS,
             {'flavor': {
                 'id': 3,
-                'name': '256 mb server',
+                'name': '256 MB Server',
                 'ram': 256,
                 'disk': 10,
             }},
         )
 
-    def get_flavors_512_mb_server(self, **kw):
+    def get_flavors_512_MB_Server(self, **kw):
         raise exceptions.NotFound('404')
 
-    def get_flavors_128_mb_server(self, **kw):
+    def get_flavors_128_MB_Server(self, **kw):
+        raise exceptions.NotFound('404')
+
+    def get_flavors_80645cf4_6ad3_410a_bbc8_6f3e1e291f51(self, **kw):
         raise exceptions.NotFound('404')
 
     def get_flavors_aa1(self, **kw):
         # Alphanumeric flavor id are allowed.
         return (
             200,
-            {},
+            FAKE_RESPONSE_HEADERS,
             {'flavor':
                 self.get_flavors_detail(is_public='None')[2]['flavors'][3]}
         )
@@ -766,15 +915,15 @@ class FakeHTTPClient(base_client.HTTPClient):
         )
 
     def delete_flavors_flavordelete(self, **kw):
-        return (202, {}, None)
+        return (202, FAKE_RESPONSE_HEADERS, None)
 
     def delete_flavors_2(self, **kw):
-        return (202, {}, None)
+        return (202, FAKE_RESPONSE_HEADERS, None)
 
     def post_flavors(self, body, **kw):
         return (
             202,
-            {},
+            FAKE_RESPONSE_HEADERS,
             {'flavor':
                 self.get_flavors_detail(is_public='None')[2]['flavors'][0]}
         )
@@ -808,7 +957,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                               required=['k1'])
         return (
             200,
-            {},
+            FAKE_RESPONSE_HEADERS,
             {'extra_specs': {"k1": "v1"}})
 
     def post_flavors_4_os_extra_specs(self, body, **kw):
@@ -816,7 +965,7 @@ class FakeHTTPClient(base_client.HTTPClient):
 
         return (
             200,
-            {},
+            FAKE_RESPONSE_HEADERS,
             body)
 
     def delete_flavors_1_os_extra_specs_k1(self, **kw):
@@ -826,28 +975,19 @@ class FakeHTTPClient(base_client.HTTPClient):
     # Flavor access
     #
 
-    def get_flavors_1_os_flavor_access(self, **kw):
-        return (404, {}, None)
-
     def get_flavors_2_os_flavor_access(self, **kw):
         return (
-            200, {},
+            200, FAKE_RESPONSE_HEADERS,
             {'flavor_access': [{'flavor_id': '2', 'tenant_id': 'proj1'},
                                {'flavor_id': '2', 'tenant_id': 'proj2'}]})
 
     def post_flavors_2_action(self, body, **kw):
-        return (202, {}, self.get_flavors_2_os_flavor_access()[2])
+        return (202, FAKE_RESPONSE_HEADERS,
+                self.get_flavors_2_os_flavor_access()[2])
 
     #
     # Floating IPs
     #
-
-    def get_os_floating_ip_pools(self):
-        return (
-            200,
-            {},
-            {'floating_ip_pools': [{'name': 'foo'}, {'name': 'bar'}]}
-        )
 
     def get_os_floating_ips(self, **kw):
         return (
@@ -936,12 +1076,6 @@ class FakeHTTPClient(base_client.HTTPClient):
             {'id': 2, 'fixed_ip': '10.0.0.2', 'ip': '11.0.0.2'},
         ]})
 
-    def get_os_floating_ips_bulk_testHost(self, **kw):
-        return (200, {}, {'floating_ip_info': [
-            {'id': 1, 'fixed_ip': '10.0.0.1', 'ip': '11.0.0.1'},
-            {'id': 2, 'fixed_ip': '10.0.0.2', 'ip': '11.0.0.2'},
-        ]})
-
     def post_os_floating_ips_bulk(self, **kw):
         params = kw.get('body').get('floating_ips_bulk_create')
         pool = params.get('pool', 'defaultPool')
@@ -960,14 +1094,34 @@ class FakeHTTPClient(base_client.HTTPClient):
     #
     def get_images(self, **kw):
         return (200, {}, {'images': [
-            {'id': 1, 'name': 'CentOS 5.2'},
-            {'id': 2, 'name': 'My Server Backup'}
+            {'id': FAKE_IMAGE_UUID_1, 'name': 'CentOS 5.2'},
+            {'id': FAKE_IMAGE_UUID_2, 'name': 'My Server Backup'}
         ]})
 
     def get_images_detail(self, **kw):
         return (200, {}, {'images': [
             {
-                'id': 1,
+                "id": FAKE_IMAGE_UUID_SNAPSHOT,
+                "name": "My Server Backup",
+                "serverId": 1234,
+                "updated": "2010-10-10T12:00:00Z",
+                "created": "2010-08-10T12:00:00Z",
+                "status": "SAVING",
+                "progress": 80,
+                "links": {},
+            },
+            {
+                "id": FAKE_IMAGE_UUID_SNAP_DEL,
+                "name": "My Server Backup Deleted",
+                "serverId": 1234,
+                "updated": "2010-10-10T12:00:00Z",
+                "created": "2010-08-10T12:00:00Z",
+                "status": "DELETED",
+                "fault": {'message': 'Image has been deleted.'},
+                "links": {},
+            },
+            {
+                'id': FAKE_IMAGE_UUID_1,
                 'name': 'CentOS 5.2',
                 "updated": "2010-10-10T12:00:00Z",
                 "created": "2010-08-10T12:00:00Z",
@@ -978,7 +1132,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                 "links": {},
             },
             {
-                "id": 2,
+                "id": FAKE_IMAGE_UUID_2,
                 "name": "My Server Backup",
                 "serverId": 1234,
                 "updated": "2010-10-10T12:00:00Z",
@@ -989,36 +1143,40 @@ class FakeHTTPClient(base_client.HTTPClient):
             }
         ]})
 
-    def get_images_1(self, **kw):
+    def get_images_555cae93_fb41_4145_9c52_f5b923538a26(self, **kw):
         return (200, {}, {'image': self.get_images_detail()[2]['images'][0]})
 
-    def get_images_2(self, **kw):
+    def get_images_55bb23af_97a4_4068_bdf8_f10c62880ddf(self, **kw):
         return (200, {}, {'image': self.get_images_detail()[2]['images'][1]})
 
-    def get_images_456(self, **kw):
-        return (200, {}, {'image': self.get_images_detail()[2]['images'][1]})
+    def get_images_c99d7632_bd66_4be9_aed5_3dd14b223a76(self, **kw):
+        return (200, {}, {'image': self.get_images_detail()[2]['images'][2]})
 
-    def post_images(self, body, **kw):
-        assert list(body) == ['image']
-        fakes.assert_has_keys(body['image'], required=['serverId', 'name'])
-        return (202, {}, self.get_images_1()[2])
+    def get_images_f27f479a_ddda_419a_9bbc_d6b56b210161(self, **kw):
+        return (200, {}, {'image': self.get_images_detail()[2]['images'][3]})
 
-    def post_images_1_metadata(self, body, **kw):
+    def get_images_3e861307_73a6_4d1f_8d68_f68b03223032(self):
+        raise exceptions.NotFound('404')
+
+    def post_images_c99d7632_bd66_4be9_aed5_3dd14b223a76_metadata(
+            self, body, **kw):
         assert list(body) == ['metadata']
         fakes.assert_has_keys(body['metadata'],
                               required=['test_key'])
+        get_image = self.get_images_c99d7632_bd66_4be9_aed5_3dd14b223a76
         return (
             200,
             {},
-            {'metadata': self.get_images_1()[2]['image']['metadata']})
+            {'metadata': get_image()[2]['image']['metadata']})
 
-    def delete_images_1(self, **kw):
+    def delete_images_c99d7632_bd66_4be9_aed5_3dd14b223a76(self, **kw):
         return (204, {}, None)
 
-    def delete_images_2(self, **kw):
+    def delete_images_f27f479a_ddda_419a_9bbc_d6b56b210161(self, **kw):
         return (204, {}, None)
 
-    def delete_images_1_metadata_test_key(self, **kw):
+    def delete_images_c99d7632_bd66_4be9_aed5_3dd14b223a76_metadata_test_key(
+            self, **kw):
         return (204, {}, None)
 
     #
@@ -1028,7 +1186,7 @@ class FakeHTTPClient(base_client.HTTPClient):
         return (200, {}, {'keypair':
                           self.get_os_keypairs()[2]['keypairs'][0]['keypair']})
 
-    def get_os_keypairs(self, *kw):
+    def get_os_keypairs(self, user_id=None, limit=None, marker=None, *kw):
         return (200, {}, {
             "keypairs": [{"keypair": {
                 "public_key": "FAKE_SSH_RSA",
@@ -1065,22 +1223,6 @@ class FakeHTTPClient(base_client.HTTPClient):
     # Quotas
     #
 
-    def get_os_quota_sets_test(self, **kw):
-        return (200, {}, {
-            'quota_set': {
-                'tenant_id': 'test',
-                'metadata_items': [],
-                'injected_file_content_bytes': 1,
-                'injected_file_path_bytes': 1,
-                'ram': 1,
-                'floating_ips': 1,
-                'instances': 1,
-                'injected_files': 1,
-                'cores': 1,
-                'keypairs': 1,
-                'security_groups': 1,
-                'security_group_rules': 1}})
-
     def get_os_quota_sets_tenant_id(self, **kw):
         return (200, {}, {
             'quota_set': {
@@ -1113,37 +1255,81 @@ class FakeHTTPClient(base_client.HTTPClient):
                 'security_groups': 1,
                 'security_group_rules': 1}})
 
-    def put_os_quota_sets_97f4c221_bff4_4578_b030_0df4ef119353(self, **kw):
+    def get_os_quota_sets_97f4c221bff44578b0300df4ef119353_detail(self, **kw):
         return (200, {}, {
             'quota_set': {
-                'tenant_id': '97f4c221-bff4-4578-b030-0df4ef119353',
-                'metadata_items': [],
-                'injected_file_content_bytes': 1,
-                'injected_file_path_bytes': 1,
-                'ram': 1,
-                'floating_ips': 1,
-                'instances': 1,
-                'injected_files': 1,
-                'cores': 1,
-                'keypairs': 1,
-                'security_groups': 1,
-                'security_group_rules': 1}})
-
-    def get_os_quota_sets_97f4c221_bff4_4578_b030_0df4ef119353(self, **kw):
-        return (200, {}, {
-            'quota_set': {
-                'tenant_id': '97f4c221-bff4-4578-b030-0df4ef119353',
-                'metadata_items': [],
-                'injected_file_content_bytes': 1,
-                'injected_file_path_bytes': 1,
-                'ram': 1,
-                'floating_ips': 1,
-                'instances': 1,
-                'injected_files': 1,
-                'cores': 1,
-                'keypairs': 1,
-                'security_groups': 1,
-                'security_group_rules': 1}})
+                'tenant_id': '97f4c221bff44578b0300df4ef119353',
+                'cores': {
+                    'in_use': 0,
+                    'limit': 20,
+                    'reserved': 0
+                },
+                'fixed_ips': {
+                    'in_use': 0,
+                    'limit': -1,
+                    'reserved': 0
+                },
+                'floating_ips': {
+                    'in_use': 0,
+                    'limit': 10,
+                    'reserved': 0
+                },
+                'injected_file_content_bytes': {
+                    'in_use': 0,
+                    'limit': 10240,
+                    'reserved': 0
+                },
+                'injected_file_path_bytes': {
+                    'in_use': 0,
+                    'limit': 255,
+                    'reserved': 0
+                },
+                'injected_files': {
+                    'in_use': 0,
+                    'limit': 5,
+                    'reserved': 0
+                },
+                'instances': {
+                    'in_use': 0,
+                    'limit': 10,
+                    'reserved': 0
+                },
+                'key_pairs': {
+                    'in_use': 0,
+                    'limit': 100,
+                    'reserved': 0
+                },
+                'metadata_items': {
+                    'in_use': 0,
+                    'limit': 128,
+                    'reserved': 0
+                },
+                'ram': {
+                    'in_use': 0,
+                    'limit': 51200,
+                    'reserved': 0
+                },
+                'security_group_rules': {
+                    'in_use': 0,
+                    'limit': 20,
+                    'reserved': 0
+                },
+                'security_groups': {
+                    'in_use': 0,
+                    'limit': 10,
+                    'reserved': 0
+                },
+                'server_group_members': {
+                    'in_use': 0,
+                    'limit': 10,
+                    'reserved': 0
+                },
+                'server_groups': {
+                    'in_use': 0,
+                    'limit': 10,
+                    'reserved': 0
+                }
+            }})
 
     def get_os_quota_sets_97f4c221bff44578b0300df4ef119353_defaults(self):
         return (200, {}, {
@@ -1179,8 +1365,7 @@ class FakeHTTPClient(base_client.HTTPClient):
 
     def put_os_quota_sets_97f4c221bff44578b0300df4ef119353(self, body, **kw):
         assert list(body) == ['quota_set']
-        fakes.assert_has_keys(body['quota_set'],
-                              required=['tenant_id'])
+        fakes.assert_has_keys(body['quota_set'])
         return (200, {}, {
             'quota_set': {
                 'tenant_id': '97f4c221bff44578b0300df4ef119353',
@@ -1196,9 +1381,6 @@ class FakeHTTPClient(base_client.HTTPClient):
                 'security_groups': 1,
                 'security_group_rules': 1}})
 
-    def delete_os_quota_sets_test(self, **kw):
-        return (202, {}, {})
-
     def delete_os_quota_sets_97f4c221bff44578b0300df4ef119353(self, **kw):
         return (202, {}, {})
 
@@ -1207,7 +1389,7 @@ class FakeHTTPClient(base_client.HTTPClient):
     #
 
     def get_os_quota_class_sets_test(self, **kw):
-        return (200, {}, {
+        return (200, FAKE_RESPONSE_HEADERS, {
             'quota_class_set': {
                 'id': 'test',
                 'metadata_items': 1,
@@ -1307,11 +1489,6 @@ class FakeHTTPClient(base_client.HTTPClient):
              "rules": []}
         ]})
 
-    def get_os_security_groups_1(self, **kw):
-        return (200, {}, {"security_group":
-                {'id': 1, 'name': 'test', 'description': 'FAKE_SECURITY_GROUP'}
-        })
-
     def delete_os_security_groups_1(self, **kw):
         return (202, {}, None)
 
@@ -1338,9 +1515,6 @@ class FakeHTTPClient(base_client.HTTPClient):
              'ip_protocol': 'TCP', 'from_port': 22, 'to_port': 22,
              'cidr': '10.0.0.0/8'}
         ]})
-
-    def delete_os_security_group_rules_1(self, **kw):
-        return (202, {}, None)
 
     def delete_os_security_group_rules_11(self, **kw):
         return (202, {}, None)
@@ -1371,30 +1545,11 @@ class FakeHTTPClient(base_client.HTTPClient):
              'to_port': 22, 'cidr': '10.0.0.0/8'}
         ]})
 
-    def delete_os_security_group_default_rules_1(self, **kw):
-        return (202, {}, None)
-
-    def delete_os_security_group_default_rules_11(self, **kw):
-        return (202, {}, None)
-
-    def delete_os_security_group_default_rules_12(self, **kw):
-        return (202, {}, None)
-
-    def post_os_security_group_default_rules(self, body, **kw):
-        assert list(body) == ['security_group_default_rule']
-        fakes.assert_has_keys(body['security_group_default_rule'],
-                              optional=['ip_protocol', 'from_port',
-                                        'to_port', 'cidr'])
-        rules = self.get_os_security_group_default_rules()
-        r = {'security_group_default_rule':
-             rules[2]['security_group_default_rules'][0]}
-        return (202, {}, r)
-
     #
     # Tenant Usage
     #
     def get_os_simple_tenant_usage(self, **kw):
-        return (200, {},
+        return (200, FAKE_RESPONSE_HEADERS,
                 {six.u('tenant_usages'): [{
                     six.u('total_memory_mb_usage'): 25451.762807466665,
                     six.u('total_vcpus_usage'): 49.71047423333333,
@@ -1420,7 +1575,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                     six.u('total_local_gb_usage'): 0.0}]})
 
     def get_os_simple_tenant_usage_tenantfoo(self, **kw):
-        return (200, {},
+        return (200, FAKE_RESPONSE_HEADERS,
                 {six.u('tenant_usage'): {
                     six.u('total_memory_mb_usage'): 25451.762807466665,
                     six.u('total_vcpus_usage'): 49.71047423333333,
@@ -1482,23 +1637,6 @@ class FakeHTTPClient(base_client.HTTPClient):
                 six.u('started_at'): six.u('2012-01-20 18:06:06.479998')}],
             six.u('start'): six.u('2011-12-25 19:48:41.750687'),
             six.u('total_local_gb_usage'): 0.0}})
-    #
-    # Certificates
-    #
-
-    def get_os_certificates_root(self, **kw):
-        return (
-            200,
-            {},
-            {'certificate': {'private_key': None, 'data': 'foo'}}
-        )
-
-    def post_os_certificates(self, **kw):
-        return (
-            200,
-            {},
-            {'certificate': {'private_key': 'foo', 'data': 'bar'}}
-        )
 
     #
     # Aggregates
@@ -1537,16 +1675,7 @@ class FakeHTTPClient(base_client.HTTPClient):
     def put_os_aggregates_1(self, body, **kw):
         return self._return_aggregate()
 
-    def put_os_aggregates_2(self, body, **kw):
-        return self._return_aggregate()
-
-    def put_os_aggregates_3(self, body, **kw):
-        return self._return_aggregate_3()
-
     def post_os_aggregates_1_action(self, body, **kw):
-        return self._return_aggregate()
-
-    def post_os_aggregates_2_action(self, body, **kw):
         return self._return_aggregate()
 
     def post_os_aggregates_3_action(self, body, **kw):
@@ -1561,41 +1690,50 @@ class FakeHTTPClient(base_client.HTTPClient):
     def get_os_services(self, **kw):
         host = kw.get('host', 'host1')
         binary = kw.get('binary', 'nova-compute')
-        return (200, {}, {'services': [{'binary': binary,
-                                        'host': host,
-                                        'zone': 'nova',
-                                        'status': 'enabled',
-                                        'state': 'up',
-                                        'updated_at': datetime.datetime(
-                                            2012, 10, 29, 13, 42, 2)},
-                                       {'binary': binary,
-                                        'host': host,
-                                        'zone': 'nova',
-                                        'status': 'disabled',
-                                        'state': 'down',
-                                        'updated_at': datetime.datetime(
-                                            2012, 9, 18, 8, 3, 38)},
-                                       ]})
+        return (200, FAKE_RESPONSE_HEADERS,
+                {'services': [{'binary': binary,
+                               'host': host,
+                               'zone': 'nova',
+                               'status': 'enabled',
+                               'state': 'up',
+                               'updated_at': datetime.datetime(
+                                   2012, 10, 29, 13, 42, 2)},
+                              {'binary': binary,
+                               'host': host,
+                               'zone': 'nova',
+                               'status': 'disabled',
+                               'state': 'down',
+                               'updated_at': datetime.datetime(
+                                   2012, 9, 18, 8, 3, 38)},
+                              ]})
 
     def put_os_services_enable(self, body, **kw):
-        return (200, {}, {'service': {'host': body['host'],
-                                      'binary': body['binary'],
-                                      'status': 'enabled'}})
+        return (200, FAKE_RESPONSE_HEADERS,
+                {'service': {'host': body['host'],
+                             'binary': body['binary'],
+                             'status': 'enabled'}})
 
     def put_os_services_disable(self, body, **kw):
-        return (200, {}, {'service': {'host': body['host'],
-                                      'binary': body['binary'],
-                                      'status': 'disabled'}})
+        return (200, FAKE_RESPONSE_HEADERS,
+                {'service': {'host': body['host'],
+                             'binary': body['binary'],
+                             'status': 'disabled'}})
 
     def put_os_services_disable_log_reason(self, body, **kw):
-        return (200, {}, {'service': {
+        return (200, FAKE_RESPONSE_HEADERS, {'service': {
             'host': body['host'],
             'binary': body['binary'],
             'status': 'disabled',
             'disabled_reason': body['disabled_reason']}})
 
     def delete_os_services_1(self, **kw):
-        return (204, {}, None)
+        return (204, FAKE_RESPONSE_HEADERS, None)
+
+    def put_os_services_force_down(self, body, **kw):
+        return (200, FAKE_RESPONSE_HEADERS, {'service': {
+            'host': body['host'],
+            'binary': body['binary'],
+            'forced_down': False}})
 
     #
     # Fixed IPs
@@ -1612,16 +1750,6 @@ class FakeHTTPClient(base_client.HTTPClient):
     #
     # Hosts
     #
-    def get_os_hosts_host(self, *kw):
-        return (200, {}, {'host':
-                [{'resource': {'project': '(total)', 'host': 'dummy',
-                  'cpu': 16, 'memory_mb': 32234, 'disk_gb': 128}},
-                 {'resource': {'project': '(used_now)', 'host': 'dummy',
-                  'cpu': 1, 'memory_mb': 2075, 'disk_gb': 45}},
-                 {'resource': {'project': '(used_max)', 'host': 'dummy',
-                  'cpu': 1, 'memory_mb': 2048, 'disk_gb': 30}},
-                 {'resource': {'project': 'admin', 'host': 'dummy',
-                  'cpu': 1, 'memory_mb': 2048, 'disk_gb': 30}}]})
 
     def get_os_hosts(self, **kw):
         zone = kw.get('zone', 'nova1')
@@ -1631,9 +1759,6 @@ class FakeHTTPClient(base_client.HTTPClient):
                                     {'host': 'host1',
                                      'service': 'nova-cert',
                                      'zone': zone}]})
-
-    def get_os_hosts_sample_host(self, *kw):
-        return (200, {}, {'host': [{'resource': {'host': 'sample_host'}}], })
 
     def put_os_hosts_sample_host_1(self, body, **kw):
         return (200, {}, {'host': 'sample-host_1',
@@ -1660,55 +1785,11 @@ class FakeHTTPClient(base_client.HTTPClient):
         return (200, {}, {'host': 'sample_host',
                           'power_action': 'shutdown'})
 
-    def put_os_hosts_sample_host(self, body, **kw):
-        result = {'host': 'dummy'}
-        result.update(body)
-        return (200, {}, result)
-
     def get_os_hypervisors(self, **kw):
         return (200, {}, {
             "hypervisors": [
                 {'id': 1234, 'hypervisor_hostname': 'hyper1'},
                 {'id': 5678, 'hypervisor_hostname': 'hyper2'}]})
-
-    def get_os_hypervisors_detail(self, **kw):
-        return (200, {}, {
-            "hypervisors": [
-                {'id': 1234,
-                 'service': {'id': 1, 'host': 'compute1'},
-                 'vcpus': 4,
-                 'memory_mb': 10 * 1024,
-                 'local_gb': 250,
-                 'vcpus_used': 2,
-                 'memory_mb_used': 5 * 1024,
-                 'local_gb_used': 125,
-                 'hypervisor_type': "xen",
-                 'hypervisor_version': 3,
-                 'hypervisor_hostname': "hyper1",
-                 'free_ram_mb': 5 * 1024,
-                 'free_disk_gb': 125,
-                 'current_workload': 2,
-                 'running_vms': 2,
-                 'cpu_info': 'cpu_info',
-                 'disk_available_least': 100},
-                {'id': 2,
-                 'service': {'id': 2, 'host': "compute2"},
-                 'vcpus': 4,
-                 'memory_mb': 10 * 1024,
-                 'local_gb': 250,
-                 'vcpus_used': 2,
-                 'memory_mb_used': 5 * 1024,
-                 'local_gb_used': 125,
-                 'hypervisor_type': "xen",
-                 'hypervisor_version': 3,
-                 'hypervisor_hostname': "hyper2",
-                 'free_ram_mb': 5 * 1024,
-                 'free_disk_gb': 125,
-                 'current_workload': 2,
-                 'running_vms': 2,
-                 'cpu_info': 'cpu_info',
-                 'disk_available_least': 100}]
-        })
 
     def get_os_hypervisors_statistics(self, **kw):
         return (200, {}, {
@@ -1726,6 +1807,48 @@ class FakeHTTPClient(base_client.HTTPClient):
                 'running_vms': 4,
                 'disk_available_least': 200}
         })
+
+    def get_os_hypervisors_hyper1(self, **kw):
+        return (200, {}, {
+            'hypervisor':
+            {'id': 1234,
+             'service': {'id': 1, 'host': 'compute1'},
+             'vcpus': 4,
+             'memory_mb': 10 * 1024,
+             'local_gb': 250,
+             'vcpus_used': 2,
+             'memory_mb_used': 5 * 1024,
+             'local_gb_used': 125,
+             'hypervisor_type': "xen",
+             'hypervisor_version': 3,
+             'hypervisor_hostname': "hyper1",
+             'free_ram_mb': 5 * 1024,
+             'free_disk_gb': 125,
+             'current_workload': 2,
+             'running_vms': 2,
+             'cpu_info': 'cpu_info',
+             'disk_available_least': 100}})
+
+    def get_os_hypervisors_region_child_1(self, **kw):
+        return (200, {}, {
+            'hypervisor':
+            {'id': 'region!child@1',
+             'service': {'id': 1, 'host': 'compute1'},
+             'vcpus': 4,
+             'memory_mb': 10 * 1024,
+             'local_gb': 250,
+             'vcpus_used': 2,
+             'memory_mb_used': 5 * 1024,
+             'local_gb_used': 125,
+             'hypervisor_type': "xen",
+             'hypervisor_version': 3,
+             'hypervisor_hostname': "hyper1",
+             'free_ram_mb': 5 * 1024,
+             'free_disk_gb': 125,
+             'current_workload': 2,
+             'running_vms': 2,
+             'cpu_info': 'cpu_info',
+             'disk_available_least': 100}})
 
     def get_os_hypervisors_hyper_search(self, **kw):
         return (200, {}, {
@@ -1779,6 +1902,56 @@ class FakeHTTPClient(base_client.HTTPClient):
                            'hypervisor_hostname': "hyper1",
                            'uptime': "fake uptime"}})
 
+    def get_os_hypervisors_region_child_1_uptime(self, **kw):
+        return (200, {}, {
+            'hypervisor': {'id': 'region!child@1',
+                           'hypervisor_hostname': "hyper1",
+                           'uptime': "fake uptime"}})
+
+    def get_v2_0_networks(self, **kw):
+        """Return neutron proxied networks.
+
+        We establish a few different possible networks that we can get
+        by name, which we can then call in tests. The only usage of
+        this API should be for name -> id translation, however a full
+        valid neutron block is provided for the private network to see
+        the kinds of things that will be in that payload.
+        """
+
+        name = kw.get('name', "blank")
+
+        networks_by_name = {
+            'private': [
+                {"status": "ACTIVE",
+                 "router:external": False,
+                 "availability_zone_hints": [],
+                 "availability_zones": ["nova"],
+                 "description": "",
+                 "name": "private",
+                 "subnets": ["64706c26-336c-4048-ab3c-23e3283bca2c",
+                             "18512740-c760-4d5f-921f-668105c9ee44"],
+                 "shared": False,
+                 "tenant_id": "abd42f270bca43ea80fe4a166bc3536c",
+                 "created_at": "2016-08-15T17:34:49",
+                 "tags": [],
+                 "ipv6_address_scope": None,
+                 "updated_at": "2016-08-15T17:34:49",
+                 "admin_state_up": True,
+                 "ipv4_address_scope": None,
+                 "port_security_enabled": True,
+                 "mtu": 1450,
+                 "id": "e43a56c7-11d4-45c9-8681-ddc8171b5850",
+                 "revision": 2}],
+            'duplicate': [
+                {"status": "ACTIVE",
+                 "id": "e43a56c7-11d4-45c9-8681-ddc8171b5850"},
+                {"status": "ACTIVE",
+                 "id": "f43a56c7-11d4-45c9-8681-ddc8171b5850"}],
+            'blank': []
+        }
+
+        return (200, {}, {"networks": networks_by_name[name]})
+
     def get_os_networks(self, **kw):
         return (200, {}, {'networks': [{"label": "1", "cidr": "10.0.0.0/24",
                                         'project_id':
@@ -1791,52 +1964,10 @@ class FakeHTTPClient(base_client.HTTPClient):
     def post_os_networks(self, **kw):
         return (202, {}, {'network': kw})
 
-    def get_os_networks_1(self, **kw):
-        return (200, {}, {'network': {"label": "1", "cidr": "10.0.0.0/24",
-                                      "id": "1"}})
-
-    def delete_os_networks_networkdelete(self, **kw):
-        return (202, {}, None)
-
     def post_os_networks_add(self, **kw):
         return (202, {}, None)
 
-    def post_os_networks_networkdisassociate_action(self, **kw):
-        return (202, {}, None)
-
-    def get_os_fping(self, **kw):
-        return (
-            200, {}, {
-                'servers': [
-                    {
-                        "id": "1",
-                        "project_id": "fake-project",
-                        "alive": True,
-                    },
-                    {
-                        "id": "2",
-                        "project_id": "fake-project",
-                        "alive": True,
-                    },
-                ]
-            }
-        )
-
-    def get_os_fping_1(self, **kw):
-        return (
-            200, {}, {
-                'server': {
-                    "id": "1",
-                    "project_id": "fake-project",
-                    "alive": True,
-                }
-            }
-        )
-
     def post_os_networks_1_action(self, **kw):
-        return (202, {}, None)
-
-    def post_os_networks_networktest_action(self, **kw):
         return (202, {}, None)
 
     def post_os_networks_2_action(self, **kw):
@@ -1858,17 +1989,6 @@ class FakeHTTPClient(base_client.HTTPClient):
 
     def delete_os_tenant_networks_1(self, **kw):
         return (202, {}, None)
-
-    def get_os_availability_zone(self, **kw):
-        return (200, {}, {
-            "availabilityZoneInfo": [
-                {"zoneName": "zone-1",
-                 "zoneState": {"available": True},
-                 "hosts": None},
-                {"zoneName": "zone-2",
-                 "zoneState": {"available": False},
-                 "hosts": None}]
-        })
 
     def get_os_availability_zone_detail(self, **kw):
         return (200, {}, {
@@ -1932,7 +2052,7 @@ class FakeHTTPClient(base_client.HTTPClient):
     # I suppose they are outdated and should be updated after Cinder released
 
     def get_volumes_detail(self, **kw):
-        return (200, {}, {"volumes": [
+        return (200, FAKE_RESPONSE_HEADERS, {"volumes": [
             {
                 "display_name": "Work",
                 "display_description": "volume for work",
@@ -1959,7 +2079,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                 "metadata": {}}]})
 
     def get_volumes(self, **kw):
-        return (200, {}, {"volumes": [
+        return (200, FAKE_RESPONSE_HEADERS, {"volumes": [
             {
                 "display_name": "Work",
                 "display_description": "volume for work",
@@ -1986,7 +2106,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                 "metadata": {}}]})
 
     def get_volumes_15e59938_07d5_11e1_90e3_e3dffe0c5983(self, **kw):
-        return (200, {}, {
+        return (200, FAKE_RESPONSE_HEADERS, {
                 "volume": self.get_volumes_detail()[2]['volumes'][0]})
 
     def get_volumes_15e59938_07d5_11e1_90e3_ee32ba30feaa(self, **kw):
@@ -1994,7 +2114,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                 "volume": self.get_volumes_detail()[2]['volumes'][1]})
 
     def post_volumes(self, **kw):
-        return (200, {}, {"volume":
+        return (200, FAKE_RESPONSE_HEADERS, {"volume":
                 {"status": "creating",
                  "display_name": "vol-007",
                  "attachments": [(0)],
@@ -2008,22 +2128,23 @@ class FakeHTTPClient(base_client.HTTPClient):
                  "size": 1}})
 
     def delete_volumes_15e59938_07d5_11e1_90e3_e3dffe0c5983(self, **kw):
-        return (200, {}, {})
+        return (200, FAKE_RESPONSE_HEADERS, {})
 
     def delete_volumes_15e59938_07d5_11e1_90e3_ee32ba30feaa(self, **kw):
         return (200, {}, {})
 
     def post_servers_1234_os_volume_attachments(self, **kw):
-        return (200, {}, {
+        return (200, FAKE_RESPONSE_HEADERS, {
             "volumeAttachment":
                 {"device": "/dev/vdb",
                  "volumeId": 2}})
 
     def put_servers_1234_os_volume_attachments_Work(self, **kw):
-        return (200, {}, {"volumeAttachment": {"volumeId": 2}})
+        return (200, FAKE_RESPONSE_HEADERS,
+                {"volumeAttachment": {"volumeId": 2}})
 
     def get_servers_1234_os_volume_attachments(self, **kw):
-        return (200, {}, {
+        return (200, FAKE_RESPONSE_HEADERS, {
             "volumeAttachments": [
                 {"display_name": "Work",
                  "display_description": "volume for work",
@@ -2036,7 +2157,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                  "metadata": {}}]})
 
     def get_servers_1234_os_volume_attachments_Work(self, **kw):
-        return (200, {}, {
+        return (200, FAKE_RESPONSE_HEADERS, {
             "volumeAttachment":
                 {"display_name": "Work",
                  "display_description": "volume for work",
@@ -2049,10 +2170,10 @@ class FakeHTTPClient(base_client.HTTPClient):
                  "metadata": {}}})
 
     def delete_servers_1234_os_volume_attachments_Work(self, **kw):
-        return (200, {}, {})
+        return (200, FAKE_RESPONSE_HEADERS, {})
 
     def get_servers_1234_os_instance_actions(self, **kw):
-        return (200, {}, {
+        return (200, FAKE_RESPONSE_HEADERS, {
             "instanceActions":
                 [{"instance_uuid": "1234",
                   "user_id": "b968c25e04ab405f9fe4e6ca54cce9a5",
@@ -2063,7 +2184,7 @@ class FakeHTTPClient(base_client.HTTPClient):
                   "project_id": "04019601fe3648c0abd4f4abfb9e6106"}]})
 
     def get_servers_1234_os_instance_actions_req_abcde12345(self, **kw):
-        return (200, {}, {
+        return (200, FAKE_RESPONSE_HEADERS, {
             "instanceAction":
                 {"instance_uuid": "1234",
                  "user_id": "b968c25e04ab405f9fe4e6ca54cce9a5",
@@ -2100,7 +2221,7 @@ class FakeHTTPClient(base_client.HTTPClient):
             'rpc_port': 5673,
             'loaded': True
         }}
-        return (200, {}, cell)
+        return (200, FAKE_RESPONSE_HEADERS, cell)
 
     def get_os_cells_capacities(self, **kw):
         cell_capacities_response = {"cell": {"capacities": {"ram_free": {
@@ -2108,28 +2229,33 @@ class FakeHTTPClient(base_client.HTTPClient):
                             "16384": 0}, "total_mb": 7680}, "disk_free": {
             "units_by_mb": {"81920": 11, "20480": 46, "40960": 23, "163840": 5,
                             "0": 0}, "total_mb": 1052672}}}}
-        return (200, {}, cell_capacities_response)
+        return (200, FAKE_RESPONSE_HEADERS, cell_capacities_response)
 
     def get_os_cells_child_cell_capacities(self, **kw):
         return self.get_os_cells_capacities()
 
     def get_os_migrations(self, **kw):
-        migrations = {'migrations': [
-            {
-                "created_at": "2012-10-29T13:42:02.000000",
-                "dest_compute": "compute2",
-                "dest_host": "1.2.3.4",
-                "dest_node": "node2",
-                "id": 1234,
-                "instance_uuid": "instance_id_123",
-                "new_instance_type_id": 2,
-                "old_instance_type_id": 1,
-                "source_compute": "compute1",
-                "source_node": "node1",
-                "status": "Done",
-                "updated_at": "2012-10-29T13:42:02.000000"
-            }]}
-        return (200, {}, migrations)
+        migration = {
+            "created_at": "2012-10-29T13:42:02.000000",
+            "dest_compute": "compute2",
+            "dest_host": "1.2.3.4",
+            "dest_node": "node2",
+            "id": 1234,
+            "instance_uuid": "instance_id_123",
+            "new_instance_type_id": 2,
+            "old_instance_type_id": 1,
+            "source_compute": "compute1",
+            "source_node": "node1",
+            "status": "Done",
+            "updated_at": "2012-10-29T13:42:02.000000"
+        }
+
+        if self.api_version >= api_versions.APIVersion("2.23"):
+            migration.update({"migration_type": "live-migration"})
+
+        migrations = {'migrations': [migration]}
+
+        return (200, FAKE_RESPONSE_HEADERS, migrations)
 
     def post_os_server_external_events(self, **kw):
         return (200, {}, {'events': [
@@ -2165,27 +2291,84 @@ class FakeHTTPClient(base_client.HTTPClient):
     def post_os_server_groups(self, body, **kw):
         return self._return_server_group()
 
-    def get_os_server_groups_2cbd51f4_fafe_4cdb_801b_cf913a6f288b(self, **kw):
-        return self._return_server_group()
-
-    def put_os_server_groups_2cbd51f4_fafe_4cdb_801b_cf913a6f288b(self, **kw):
-        return self._return_server_group()
-
-    def post_os_server_groups_2cbd51f4_fafe_4cdb_801b_cf913a6f288b_action(
-            self, body, **kw):
-        return self._return_server_group()
-
-    def delete_os_server_groups_2cbd51f4_fafe_4cdb_801b_cf913a6f288b(
-            self, **kw):
+    def post_servers_1234_migrations_1_action(self, body):
         return (202, {}, None)
+
+    @api_versions.wraps(start_version="2.23")
+    def get_servers_1234_migrations_1(self, **kw):
+        migration = {"migration": {
+            "created_at": "2016-01-29T13:42:02.000000",
+            "dest_compute": "compute2",
+            "dest_host": "1.2.3.4",
+            "dest_node": "node2",
+            "id": 1,
+            "server_uuid": "4cfba335-03d8-49b2-8c52-e69043d1e8fe",
+            "source_compute": "compute1",
+            "source_node": "node1",
+            "status": "running",
+            "memory_total_bytes": 123456,
+            "memory_processed_bytes": 12345,
+            "memory_remaining_bytes": 120000,
+            "disk_total_bytes": 234567,
+            "disk_processed_bytes": 23456,
+            "disk_remaining_bytes": 230000,
+            "updated_at": "2016-01-29T13:42:02.000000"
+        }}
+        return (200, FAKE_RESPONSE_HEADERS, migration)
+
+    @api_versions.wraps(start_version="2.23")
+    def get_servers_1234_migrations(self, **kw):
+        migrations = {'migrations': [
+            {
+                "created_at": "2016-01-29T13:42:02.000000",
+                "dest_compute": "compute2",
+                "dest_host": "1.2.3.4",
+                "dest_node": "node2",
+                "id": 1,
+                "server_uuid": "4cfba335-03d8-49b2-8c52-e69043d1e8fe",
+                "source_compute": "compute1",
+                "source_node": "node1",
+                "status": "running",
+                "memory_total_bytes": 123456,
+                "memory_processed_bytes": 12345,
+                "memory_remaining_bytes": 120000,
+                "disk_total_bytes": 234567,
+                "disk_processed_bytes": 23456,
+                "disk_remaining_bytes": 230000,
+                "updated_at": "2016-01-29T13:42:02.000000"
+            }]}
+        return (200, FAKE_RESPONSE_HEADERS, migrations)
+
+    def delete_servers_1234_migrations_1(self):
+        return (202, {}, None)
+
+    def put_servers_1234_tags_tag(self, **kw):
+        return (201, {}, None)
+
+    def put_servers_1234_tags(self, **kw):
+        return (201, {}, None)
+
+    def get_servers_1234_tags(self, **kw):
+        return (200, {}, {'tags': ['tag1', 'tag2']})
+
+    def delete_servers_1234_tags_tag(self, **kw):
+        return (204, {}, None)
+
+    def delete_servers_1234_tags(self, **kw):
+        return (204, {}, None)
+
+    def get_servers_1234_tags_tag(self, **kw):
+        return (204, {}, None)
 
 
 class FakeSessionClient(fakes.FakeClient, client.Client):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, api_version, *args, **kwargs):
         client.Client.__init__(self, 'username', 'password',
                                'project_id', 'auth_url',
-                               extensions=kwargs.get('extensions'))
+                               extensions=kwargs.get('extensions'),
+                               direct_use=False)
+        kwargs["api_version"] = api_version
         self.client = FakeSessionMockClient(**kwargs)
 
 
@@ -2196,8 +2379,15 @@ class FakeSessionMockClient(base_client.SessionClient, FakeHTTPClient):
         self.callstack = []
         self.auth = mock.Mock()
         self.session = mock.Mock()
+        self.session.get_endpoint.return_value = FakeHTTPClient.get_endpoint(
+            self)
         self.service_type = 'service_type'
-
+        self.service_name = None
+        self.endpoint_override = None
+        self.interface = None
+        self.region_name = None
+        self.version = None
+        self.api_version = kwargs.get('api_version')
         self.auth.get_auth_ref.return_value.project_id = 'tenant_id'
 
     def request(self, url, method, **kwargs):

@@ -16,31 +16,38 @@
 """
 Bulk Floating IPs interface
 """
+from novaclient import api_versions
 from novaclient import base
+from novaclient.v2 import floating_ips
 
 
-class FloatingIP(base.Resource):
+class FloatingIPRange(base.Resource):
+    """DEPRECATED"""
+
     def __repr__(self):
-        return "<FloatingIP: %s>" % self.address
+        return "<FloatingIPRange: %s>" % self.ip_range
 
 
 class FloatingIPBulkManager(base.ManagerWithFind):
-    resource_class = FloatingIP
+    """DEPRECATED"""
 
+    resource_class = FloatingIPRange
+
+    @api_versions.deprecated_after('2.35')
     def list(self, host=None):
-        """
-        List all floating IPs
-        """
+        """DEPRECATED: List all floating IPs."""
         if host is None:
-            return self._list('/os-floating-ips-bulk', 'floating_ip_info')
+            return self._list('/os-floating-ips-bulk',
+                              'floating_ip_info',
+                              obj_class=floating_ips.FloatingIP)
         else:
             return self._list('/os-floating-ips-bulk/%s' % host,
-                              'floating_ip_info')
+                              'floating_ip_info',
+                              obj_class=floating_ips.FloatingIP)
 
+    @api_versions.deprecated_after('2.35')
     def create(self, ip_range, pool=None, interface=None):
-        """
-        Create floating IPs by range
-        """
+        """DEPRECATED: Create floating IPs by range."""
         body = {"floating_ips_bulk_create": {'ip_range': ip_range}}
         if pool is not None:
             body['floating_ips_bulk_create']['pool'] = pool
@@ -50,9 +57,8 @@ class FloatingIPBulkManager(base.ManagerWithFind):
         return self._create('/os-floating-ips-bulk', body,
                             'floating_ips_bulk_create')
 
+    @api_versions.deprecated_after('2.35')
     def delete(self, ip_range):
-        """
-        Delete floating IPs by range
-        """
+        """DEPRECATED: Delete floating IPs by range."""
         body = {"ip_range": ip_range}
         return self._update('/os-floating-ips-bulk/delete', body)

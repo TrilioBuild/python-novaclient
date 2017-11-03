@@ -13,7 +13,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import logging
+
+from keystoneauth1.exceptions import catalog as key_ex
+
 from novaclient import client
+from novaclient import exceptions
+from novaclient.i18n import _LE
 from novaclient.v2 import agents
 from novaclient.v2 import aggregates
 from novaclient.v2 import availability_zones
@@ -39,58 +45,20 @@ from novaclient.v2 import security_group_default_rules
 from novaclient.v2 import security_group_rules
 from novaclient.v2 import security_groups
 from novaclient.v2 import server_groups
+from novaclient.v2 import server_migrations
 from novaclient.v2 import servers
 from novaclient.v2 import services
 from novaclient.v2 import usage
 from novaclient.v2 import versions
 from novaclient.v2 import virtual_interfaces
-from novaclient.v2 import volume_snapshots
-from novaclient.v2 import volume_types
 from novaclient.v2 import volumes
 
 
 class Client(object):
-    """
-    Top-level object to access the OpenStack Compute API.
+    """Top-level object to access the OpenStack Compute API.
 
-    Create an instance with your creds::
-
-        >>> client = Client(USERNAME, PASSWORD, PROJECT_ID, AUTH_URL)
-
-    Or, alternatively, you can create a client instance using the
-    keystoneclient.session API::
-
-        >>> from keystoneclient.auth.identity import v2
-        >>> from keystoneclient import session
-        >>> from novaclient.client import Client
-        >>> auth = v2.Password(auth_url=AUTH_URL,
-                               username=USERNAME,
-                               password=PASSWORD,
-                               tenant_name=PROJECT_ID)
-        >>> sess = session.Session(auth=auth)
-        >>> nova = client.Client(VERSION, session=sess)
-
-    Then call methods on its managers::
-
-        >>> client.servers.list()
-        ...
-        >>> client.flavors.list()
-        ...
-
-    It is also possible to use an instance as a context manager in which
-    case there will be a session kept alive for the duration of the with
-    statement::
-
-        >>> with Client(USERNAME, PASSWORD, PROJECT_ID, AUTH_URL) as client:
-        ...     client.servers.list()
-        ...     client.flavors.list()
-        ...
-
-    It is also possible to have a permanent (process-long) connection pool,
-    by passing a connection_pool=True::
-
-        >>> client = Client(USERNAME, PASSWORD, PROJECT_ID,
-        ...     AUTH_URL, connection_pool=True)
+    .. warning:: All scripts and projects should not initialize this class
+      directly. It should be done via `novaclient.client.Client` interface.
     """
 
     def __init__(self, username=None, api_key=None, project_id=None,
@@ -103,8 +71,9 @@ class Client(object):
                  auth_system='keystone', auth_plugin=None, auth_token=None,
                  cacert=None, tenant_id=None, user_id=None,
                  connection_pool=False, session=None, auth=None,
-                 **kwargs):
-        """
+                 api_version=None, direct_use=True, logger=None, **kwargs):
+        """Initialization of Client object.
+
         :param str username: Username
         :param str api_key: API Key
         :param str project_id: Project ID
@@ -115,7 +84,7 @@ class Client(object):
         :param str proxy_token: Proxy Token
         :param str region_name: Region Name
         :param str endpoint_type: Endpoint Type
-        :param str extensions: Exensions
+        :param str extensions: Extensions
         :param str service_type: Service Type
         :param str service_name: Service Name
         :param str volume_service_name: Volume Service Name
@@ -133,7 +102,20 @@ class Client(object):
         :param bool connection_pool: Use a connection pool
         :param str session: Session
         :param str auth: Auth
+        :param api_version: Compute API version
+        :param direct_use: Inner variable of novaclient. Do not use it outside
+            novaclient. It's restricted.
+        :param logger: Logger
+        :type api_version: novaclient.api_versions.APIVersion
         """
+        if direct_use:
+            raise exceptions.Forbidden(
+                403, _LE("'novaclient.v2.client.Client' is not designed to be "
+                         "initialized directly. It is inner class of "
+                         "novaclient. You should use "
+                         "'novaclient.client.Client' instead. Related lp "
+                         "bug-report: 1493576"))
+
         # FIXME(comstud): Rename the api_key argument above when we
         # know it's not being used as keyword argument
 
@@ -143,13 +125,14 @@ class Client(object):
         # tenant name) and tenant_id is a UUID (what the Nova API
         # often refers to as a project_id or tenant_id).
 
-        password = api_key
+        password = kwargs.pop('password', api_key)
         self.projectid = project_id
         self.tenant_id = tenant_id
         self.user_id = user_id
         self.flavors = flavors.FlavorManager(self)
         self.flavor_access = flavor_access.FlavorAccessManager(self)
         self.images = images.ImageManager(self)
+        self.glance = images.GlanceManager(self)
         self.limits = limits.LimitsManager(self)
         self.servers = servers.ServerManager(self)
         self.versions = versions.VersionManager(self)
@@ -164,10 +147,9 @@ class Client(object):
         self.floating_ip_pools = floating_ip_pools.FloatingIPPoolManager(self)
         self.fping = fping.FpingManager(self)
         self.volumes = volumes.VolumeManager(self)
-        self.volume_snapshots = volume_snapshots.SnapshotManager(self)
-        self.volume_types = volume_types.VolumeTypeManager(self)
         self.keypairs = keypairs.KeypairManager(self)
         self.networks = networks.NetworkManager(self)
+        self.neutron = networks.NeutronManager(self)
         self.quota_classes = quota_classes.QuotaClassSetManager(self)
         self.quotas = quotas.QuotaSetManager(self)
         self.security_groups = security_groups.SecurityGroupManager(self)
@@ -189,6 +171,8 @@ class Client(object):
         self.availability_zones = \
             availability_zones.AvailabilityZoneManager(self)
         self.server_groups = server_groups.ServerGroupsManager(self)
+        self.server_migrations = \
+            server_migrations.ServerMigrationsManager(self)
 
         # Add in any extensions...
         if extensions:
@@ -196,6 +180,9 @@ class Client(object):
                 if extension.manager_class:
                     setattr(self, extension.name,
                             extension.manager_class(self))
+
+        if not logger:
+            logger = logging.getLogger(__name__)
 
         self.client = client._construct_http_client(
             username=username,
@@ -224,7 +211,17 @@ class Client(object):
             connection_pool=connection_pool,
             session=session,
             auth=auth,
+            api_version=api_version,
+            logger=logger,
             **kwargs)
+
+    @property
+    def api_version(self):
+        return self.client.api_version
+
+    @api_version.setter
+    def api_version(self, value):
+        self.client.api_version = value
 
     @client._original_only
     def __enter__(self):
@@ -245,10 +242,26 @@ class Client(object):
     def reset_timings(self):
         self.client.reset_timings()
 
+    def has_neutron(self):
+        """Check the service catalog to figure out if we have neutron.
+
+        This is an intermediary solution for the window of time where
+        we still have nova-network support in the client, but we
+        expect most people have neutron. This ensures that if they
+        have neutron we understand, we talk to it, if they don't, we
+        fail back to nova proxies.
+        """
+        try:
+            endpoint = self.client.get_endpoint(service_type='network')
+            if endpoint:
+                return True
+            return False
+        except key_ex.EndpointNotFound:
+            return False
+
     @client._original_only
     def authenticate(self):
-        """
-        Authenticate against the server.
+        """Authenticate against the server.
 
         Normally this is called automatically when you first access the API,
         but you can call this method to force authentication right now.

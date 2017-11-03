@@ -17,112 +17,38 @@
 Volume interface (1.1 extension).
 """
 
-import six
-from six.moves.urllib import parse
-
 from novaclient import base
 
 
 class Volume(base.Resource):
     """
-    A volume is an extra block level storage to the OpenStack instances.
+    A volume is an extra block level storage to the OpenStack
+    instances.
     """
     NAME_ATTR = 'display_name'
 
     def __repr__(self):
         return "<Volume: %s>" % self.id
 
-    def delete(self):
-        """
-        Delete this volume.
-        """
-        self.manager.delete(self)
 
-
-class VolumeManager(base.ManagerWithFind):
+class VolumeManager(base.Manager):
     """
-    Manage :class:`Volume` resources.
+    Manage :class:`Volume` resources. This is really about volume attachments.
     """
     resource_class = Volume
 
-    def create(self, size, snapshot_id=None, display_name=None,
-               display_description=None, volume_type=None,
-               availability_zone=None, imageRef=None):
-        """
-        Create a volume.
-
-        :param size: Size of volume in GB
-        :param snapshot_id: ID of the snapshot
-        :param display_name: Name of the volume
-        :param display_description: Description of the volume
-        :param volume_type: Type of volume
-        :param availability_zone: Availability Zone for volume
-        :rtype: :class:`Volume`
-        :param imageRef: reference to an image stored in glance
-        """
-        # NOTE(melwitt): Ensure we use the volume endpoint for this call
-        with self.alternate_service_type('volume'):
-            body = {'volume': {'size': size,
-                               'snapshot_id': snapshot_id,
-                               'display_name': display_name,
-                               'display_description': display_description,
-                               'volume_type': volume_type,
-                               'availability_zone': availability_zone,
-                               'imageRef': imageRef}}
-            return self._create('/volumes', body, 'volume')
-
-    def get(self, volume_id):
-        """
-        Get a volume.
-
-        :param volume_id: The ID of the volume to get.
-        :rtype: :class:`Volume`
-        """
-        with self.alternate_service_type('volume'):
-            return self._get("/volumes/%s" % volume_id, "volume")
-
-    def list(self, detailed=True, search_opts=None):
-        """
-        Get a list of all volumes.
-
-        :rtype: list of :class:`Volume`
-        """
-        with self.alternate_service_type('volume'):
-            search_opts = search_opts or {}
-
-            if 'name' in search_opts.keys():
-                search_opts['display_name'] = search_opts.pop('name')
-
-            qparams = dict((k, v) for (k, v) in
-                           six.iteritems(search_opts) if v)
-
-            query_str = '?%s' % parse.urlencode(qparams) if qparams else ''
-
-            if detailed is True:
-                return self._list("/volumes/detail%s" % query_str, "volumes")
-            else:
-                return self._list("/volumes%s" % query_str, "volumes")
-
-    def delete(self, volume):
-        """
-        Delete a volume.
-
-        :param volume: The :class:`Volume` to delete.
-        """
-        with self.alternate_service_type('volume'):
-            self._delete("/volumes/%s" % base.getid(volume))
-
-    def create_server_volume(self, server_id, volume_id, device):
+    def create_server_volume(self, server_id, volume_id, device=None):
         """
         Attach a volume identified by the volume ID to the given server ID
 
         :param server_id: The ID of the server
         :param volume_id: The ID of the volume to attach.
-        :param device: The device name
+        :param device: The device name (optional)
         :rtype: :class:`Volume`
         """
-        body = {'volumeAttachment': {'volumeId': volume_id,
-                                     'device': device}}
+        body = {'volumeAttachment': {'volumeId': volume_id}}
+        if device is not None:
+            body['volumeAttachment']['device'] = device
         return self._create("/servers/%s/os-volume_attachments" % server_id,
                             body, "volumeAttachment")
 
@@ -169,6 +95,7 @@ class VolumeManager(base.ManagerWithFind):
 
         :param server_id: The ID of the server
         :param attachment_id: The ID of the attachment
+        :returns: An instance of novaclient.base.TupleWithMeta
         """
-        self._delete("/servers/%s/os-volume_attachments/%s" %
-                     (server_id, attachment_id,))
+        return self._delete("/servers/%s/os-volume_attachments/%s" %
+                            (server_id, attachment_id,))

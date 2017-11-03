@@ -22,21 +22,23 @@ from novaclient.tests.unit.v2.contrib import fakes
 from novaclient.v2.contrib import assisted_volume_snapshots as assisted_snaps
 
 
-extensions = [
-    extension.Extension(assisted_snaps.__name__.split(".")[-1],
-                        assisted_snaps),
-]
-cs = fakes.FakeClient(extensions=extensions)
-
-
 class AssistedVolumeSnapshotsTestCase(utils.TestCase):
+    def setUp(self):
+        super(AssistedVolumeSnapshotsTestCase, self).setUp()
+        extensions = [
+            extension.Extension(assisted_snaps.__name__.split(".")[-1],
+                                assisted_snaps),
+        ]
+        self.cs = fakes.FakeClient(extensions=extensions)
 
     def test_create_snap(self):
-        cs.assisted_volume_snapshots.create('1', {})
-        cs.assert_called('POST', '/os-assisted-volume-snapshots')
+        vs = self.cs.assisted_volume_snapshots.create('1', {})
+        self.assert_request_id(vs, fakes.FAKE_REQUEST_ID_LIST)
+        self.cs.assert_called('POST', '/os-assisted-volume-snapshots')
 
     def test_delete_snap(self):
-        cs.assisted_volume_snapshots.delete('x', {})
-        cs.assert_called(
+        vs = self.cs.assisted_volume_snapshots.delete('x', {})
+        self.assert_request_id(vs, fakes.FAKE_REQUEST_ID_LIST)
+        self.cs.assert_called(
             'DELETE',
             '/os-assisted-volume-snapshots/x?delete_info={}')

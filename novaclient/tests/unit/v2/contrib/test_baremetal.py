@@ -14,51 +14,41 @@
 #    under the License.
 
 
+import mock
+import warnings
+
 from novaclient import extension
 from novaclient.tests.unit import utils
 from novaclient.tests.unit.v2.contrib import fakes
 from novaclient.v2.contrib import baremetal
 
 
-extensions = [
-    extension.Extension(baremetal.__name__.split(".")[-1], baremetal),
-]
-cs = fakes.FakeClient(extensions=extensions)
-
-
+@mock.patch.object(warnings, 'warn')
 class BaremetalExtensionTest(utils.TestCase):
+    def setUp(self):
+        super(BaremetalExtensionTest, self).setUp()
+        extensions = [
+            extension.Extension(baremetal.__name__.split(".")[-1], baremetal),
+        ]
+        self.cs = fakes.FakeClient(extensions=extensions)
 
-    def test_list_nodes(self):
-        nl = cs.baremetal.list()
-        cs.assert_called('GET', '/os-baremetal-nodes')
+    def test_list_nodes(self, mock_warn):
+        nl = self.cs.baremetal.list()
+        self.assert_request_id(nl, fakes.FAKE_REQUEST_ID_LIST)
+        self.cs.assert_called('GET', '/os-baremetal-nodes')
         for n in nl:
             self.assertIsInstance(n, baremetal.BareMetalNode)
+        self.assertEqual(1, mock_warn.call_count)
 
-    def test_get_node(self):
-        n = cs.baremetal.get(1)
-        cs.assert_called('GET', '/os-baremetal-nodes/1')
+    def test_get_node(self, mock_warn):
+        n = self.cs.baremetal.get(1)
+        self.assert_request_id(n, fakes.FAKE_REQUEST_ID_LIST)
+        self.cs.assert_called('GET', '/os-baremetal-nodes/1')
         self.assertIsInstance(n, baremetal.BareMetalNode)
+        self.assertEqual(1, mock_warn.call_count)
 
-    def test_create_node(self):
-        n = cs.baremetal.create("service_host", 1, 1024, 2048,
-                                "aa:bb:cc:dd:ee:ff")
-        cs.assert_called('POST', '/os-baremetal-nodes')
-        self.assertIsInstance(n, baremetal.BareMetalNode)
-
-    def test_delete_node(self):
-        n = cs.baremetal.get(1)
-        cs.baremetal.delete(n)
-        cs.assert_called('DELETE', '/os-baremetal-nodes/1')
-
-    def test_node_add_interface(self):
-        i = cs.baremetal.add_interface(1, "bb:cc:dd:ee:ff:aa", 1, 2)
-        cs.assert_called('POST', '/os-baremetal-nodes/1/action')
-        self.assertIsInstance(i, baremetal.BareMetalNodeInterface)
-
-    def test_node_remove_interface(self):
-        cs.baremetal.remove_interface(1, "bb:cc:dd:ee:ff:aa")
-        cs.assert_called('POST', '/os-baremetal-nodes/1/action')
-
-    def test_node_list_interfaces(self):
-        cs.baremetal.list_interfaces(1)
-        cs.assert_called('GET', '/os-baremetal-nodes/1')
+    def test_node_list_interfaces(self, mock_warn):
+        il = self.cs.baremetal.list_interfaces(1)
+        self.assert_request_id(il, fakes.FAKE_REQUEST_ID_LIST)
+        self.cs.assert_called('GET', '/os-baremetal-nodes/1')
+        self.assertEqual(1, mock_warn.call_count)

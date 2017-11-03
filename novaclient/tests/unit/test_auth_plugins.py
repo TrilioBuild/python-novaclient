@@ -15,7 +15,7 @@
 
 import argparse
 
-from keystoneclient import fixture
+from keystoneauth1 import fixture
 import mock
 import pkg_resources
 import requests
@@ -26,9 +26,9 @@ except ImportError:
     import simplejson as json
 
 from novaclient import auth_plugin
+from novaclient import client
 from novaclient import exceptions
 from novaclient.tests.unit import utils
-from novaclient.v2 import client
 
 
 def mock_http_request(resp=None):
@@ -58,7 +58,10 @@ def requested_headers(cs):
 class DeprecatedAuthPluginTest(utils.TestCase):
     def test_auth_system_success(self):
         class MockEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
+                return self.authenticate
+
+            def resolve(self):
                 return self.authenticate
 
             def authenticate(self, cls, auth_url):
@@ -77,7 +80,7 @@ class DeprecatedAuthPluginTest(utils.TestCase):
         @mock.patch.object(requests, "request", mock_request)
         def test_auth_call():
             plugin = auth_plugin.DeprecatedAuthPlugin("fake")
-            cs = client.Client("username", "password", "project_id",
+            cs = client.Client("2", "username", "password", "project_id",
                                utils.AUTH_URL_V2, auth_system="fake",
                                auth_plugin=plugin)
             cs.client.authenticate()
@@ -107,7 +110,7 @@ class DeprecatedAuthPluginTest(utils.TestCase):
         def test_auth_call():
             auth_plugin.discover_auth_systems()
             plugin = auth_plugin.DeprecatedAuthPlugin("notexists")
-            cs = client.Client("username", "password", "project_id",
+            cs = client.Client("2", "username", "password", "project_id",
                                utils.AUTH_URL_V2, auth_system="notexists",
                                auth_plugin=plugin)
             self.assertRaises(exceptions.AuthSystemNotFound,
@@ -117,14 +120,20 @@ class DeprecatedAuthPluginTest(utils.TestCase):
 
     def test_auth_system_defining_auth_url(self):
         class MockAuthUrlEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
+                return self.auth_url
+
+            def resolve(self):
                 return self.auth_url
 
             def auth_url(self):
                 return "http://faked/v2.0"
 
         class MockAuthenticateEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
+                return self.authenticate
+
+            def resolve(self):
                 return self.authenticate
 
             def authenticate(self, cls, auth_url):
@@ -149,7 +158,7 @@ class DeprecatedAuthPluginTest(utils.TestCase):
         @mock.patch.object(requests, "request", mock_request)
         def test_auth_call():
             plugin = auth_plugin.DeprecatedAuthPlugin("fakewithauthurl")
-            cs = client.Client("username", "password", "project_id",
+            cs = client.Client("2", "username", "password", "project_id",
                                auth_system="fakewithauthurl",
                                auth_plugin=plugin)
             cs.client.authenticate()
@@ -160,7 +169,10 @@ class DeprecatedAuthPluginTest(utils.TestCase):
     @mock.patch.object(pkg_resources, "iter_entry_points")
     def test_client_raises_exc_without_auth_url(self, mock_iter_entry_points):
         class MockAuthUrlEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
+                return self.auth_url
+
+            def resolve(self):
                 return self.auth_url
 
             def auth_url(self):
@@ -174,7 +186,7 @@ class DeprecatedAuthPluginTest(utils.TestCase):
         plugin = auth_plugin.DeprecatedAuthPlugin("fakewithauthurl")
         self.assertRaises(
             exceptions.EndpointNotFound,
-            client.Client, "username", "password", "project_id",
+            client.Client, "2", "username", "password", "project_id",
             auth_system="fakewithauthurl", auth_plugin=plugin)
 
 
@@ -184,21 +196,24 @@ class AuthPluginTest(utils.TestCase):
     def test_auth_system_success(self, mock_iter_entry_points, mock_request):
         """Test that we can authenticate using the auth system."""
         class MockEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
+                return FakePlugin
+
+            def resolve(self):
                 return FakePlugin
 
         class FakePlugin(auth_plugin.BaseAuthPlugin):
             def authenticate(self, cls, auth_url):
                 cls._authenticate(auth_url, {"fake": "me"})
 
-        mock_iter_entry_points.side_effect = lambda _t: [
+        mock_iter_entry_points.side_effect = lambda _t, name=None: [
             MockEntrypoint("fake", "fake", ["FakePlugin"])]
 
         mock_request.side_effect = mock_http_request()
 
         auth_plugin.discover_auth_systems()
         plugin = auth_plugin.load_plugin("fake")
-        cs = client.Client("username", "password", "project_id",
+        cs = client.Client("2", "username", "password", "project_id",
                            utils.AUTH_URL_V2, auth_system="fake",
                            auth_plugin=plugin)
         cs.client.authenticate()
@@ -227,10 +242,13 @@ class AuthPluginTest(utils.TestCase):
                 return parser
 
         class MockEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
                 return FakePlugin
 
-        mock_iter_entry_points.side_effect = lambda _t: [
+            def resolve(self):
+                return FakePlugin
+
+        mock_iter_entry_points.side_effect = lambda _t, name=None: [
             MockEntrypoint("fake", "fake", ["FakePlugin"])]
 
         parser = argparse.ArgumentParser()
@@ -244,7 +262,10 @@ class AuthPluginTest(utils.TestCase):
     def test_parse_auth_system_options(self, mock_iter_entry_points):
         """Test that we can parse the auth system options."""
         class MockEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
+                return FakePlugin
+
+            def resolve(self):
                 return FakePlugin
 
         class FakePlugin(auth_plugin.BaseAuthPlugin):
@@ -254,7 +275,7 @@ class AuthPluginTest(utils.TestCase):
             def parse_opts(self, args):
                 return self.opts
 
-        mock_iter_entry_points.side_effect = lambda _t: [
+        mock_iter_entry_points.side_effect = lambda _t, name=None: [
             MockEntrypoint("fake", "fake", ["FakePlugin"])]
 
         auth_plugin.discover_auth_systems()
@@ -267,20 +288,23 @@ class AuthPluginTest(utils.TestCase):
     def test_auth_system_defining_url(self, mock_iter_entry_points):
         """Test the auth_system defining an url."""
         class MockEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
+                return FakePlugin
+
+            def resolve(self):
                 return FakePlugin
 
         class FakePlugin(auth_plugin.BaseAuthPlugin):
             def get_auth_url(self):
                 return "http://faked/v2.0"
 
-        mock_iter_entry_points.side_effect = lambda _t: [
+        mock_iter_entry_points.side_effect = lambda _t, name=None: [
             MockEntrypoint("fake", "fake", ["FakePlugin"])]
 
         auth_plugin.discover_auth_systems()
         plugin = auth_plugin.load_plugin("fake")
 
-        cs = client.Client("username", "password", "project_id",
+        cs = client.Client("2", "username", "password", "project_id",
                            auth_system="fakewithauthurl",
                            auth_plugin=plugin)
         self.assertEqual("http://faked/v2.0", cs.client.auth_url)
@@ -289,13 +313,16 @@ class AuthPluginTest(utils.TestCase):
     def test_exception_if_no_authenticate(self, mock_iter_entry_points):
         """Test that no authenticate raises a proper exception."""
         class MockEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
+                return FakePlugin
+
+            def resolve(self):
                 return FakePlugin
 
         class FakePlugin(auth_plugin.BaseAuthPlugin):
             pass
 
-        mock_iter_entry_points.side_effect = lambda _t: [
+        mock_iter_entry_points.side_effect = lambda _t, name=None: [
             MockEntrypoint("fake", "fake", ["FakePlugin"])]
 
         auth_plugin.discover_auth_systems()
@@ -303,20 +330,23 @@ class AuthPluginTest(utils.TestCase):
 
         self.assertRaises(
             exceptions.EndpointNotFound,
-            client.Client, "username", "password", "project_id",
+            client.Client, "2", "username", "password", "project_id",
             auth_system="fake", auth_plugin=plugin)
 
     @mock.patch.object(pkg_resources, "iter_entry_points")
     def test_exception_if_no_url(self, mock_iter_entry_points):
         """Test that no auth_url at all raises exception."""
         class MockEntrypoint(pkg_resources.EntryPoint):
-            def load(self):
+            def load(self, require=False):
+                return FakePlugin
+
+            def resolve(self):
                 return FakePlugin
 
         class FakePlugin(auth_plugin.BaseAuthPlugin):
             pass
 
-        mock_iter_entry_points.side_effect = lambda _t: [
+        mock_iter_entry_points.side_effect = lambda _t, name=None: [
             MockEntrypoint("fake", "fake", ["FakePlugin"])]
 
         auth_plugin.discover_auth_systems()
@@ -324,5 +354,5 @@ class AuthPluginTest(utils.TestCase):
 
         self.assertRaises(
             exceptions.EndpointNotFound,
-            client.Client, "username", "password", "project_id",
+            client.Client, "2", "username", "password", "project_id",
             auth_system="fake", auth_plugin=plugin)

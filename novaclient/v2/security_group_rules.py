@@ -16,27 +16,37 @@
 """
 Security group rules interface (1.1 extension).
 """
-
+from novaclient import api_versions
 from novaclient import base
 from novaclient import exceptions
 from novaclient.i18n import _
 
 
 class SecurityGroupRule(base.Resource):
+    """DEPRECATED"""
+
     def __str__(self):
         return str(self.id)
 
     def delete(self):
-        self.manager.delete(self)
+        """
+        DEPRECATED: Delete this security group rule.
+
+        :returns: An instance of novaclient.base.TupleWithMeta
+        """
+        return self.manager.delete(self)
 
 
 class SecurityGroupRuleManager(base.Manager):
+    """DEPRECATED"""
+
     resource_class = SecurityGroupRule
 
+    @api_versions.deprecated_after('2.35')
     def create(self, parent_group_id, ip_protocol=None, from_port=None,
                to_port=None, cidr=None, group_id=None):
         """
-        Create a security group rule
+        DEPRECATED: Create a security group rule
 
         :param ip_protocol: IP protocol, one of 'tcp', 'udp' or 'icmp'
         :param from_port: Source port
@@ -69,10 +79,12 @@ class SecurityGroupRuleManager(base.Manager):
         return self._create('/os-security-group-rules', body,
                             'security_group_rule')
 
+    @api_versions.deprecated_after('2.35')
     def delete(self, rule):
         """
-        Delete a security group rule
+        DEPRECATED: Delete a security group rule
 
         :param rule: The security group rule to delete (ID or Class)
+        :returns: An instance of novaclient.base.TupleWithMeta
         """
-        self._delete('/os-security-group-rules/%s' % base.getid(rule))
+        return self._delete('/os-security-group-rules/%s' % base.getid(rule))

@@ -11,7 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from keystoneclient import fixture
+from keystoneauth1 import fixture
 
 from novaclient import exceptions
 from novaclient import service_catalog
@@ -58,16 +58,3 @@ class ServiceCatalogTest(utils.TestCase):
         # Matching south (and catalog has South).
         self.assertRaises(exceptions.AmbiguousEndpoints, sc.url_for,
                           'region', 'south', service_type='volume')
-
-    def test_alternate_service_type(self):
-        sc = service_catalog.ServiceCatalog(SERVICE_CATALOG)
-
-        self.assertRaises(exceptions.AmbiguousEndpoints, sc.url_for,
-                          service_type='volume')
-        self.assertEqual("https://volume1.host/v1/1",
-                         sc.url_for('tenantId', '1', service_type='volume'))
-        self.assertEqual("https://volume1.host/v1.1/2",
-                         sc.url_for('tenantId', '2', service_type='volume'))
-
-        self.assertRaises(exceptions.EndpointNotFound, sc.url_for,
-                          "region", "North", service_type='volume')

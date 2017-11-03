@@ -11,23 +11,109 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import contextlib
 import json
+import os
 import re
 import textwrap
+import time
 import uuid
 
-from oslo.serialization import jsonutils
-from oslo.utils import encodeutils
+from oslo_serialization import jsonutils
+from oslo_utils import encodeutils
 import pkg_resources
 import prettytable
 import six
+from six.moves.urllib import parse
 
 from novaclient import exceptions
 from novaclient.i18n import _
-from novaclient.openstack.common import cliutils
 
 
 VALID_KEY_REGEX = re.compile(r"[\w\.\- :]+$", re.UNICODE)
+
+
+def env(*args, **kwargs):
+    """Returns the first environment variable set.
+
+    If all are empty, defaults to '' or keyword arg `default`.
+    """
+    for arg in args:
+        value = os.environ.get(arg)
+        if value:
+            return value
+    return kwargs.get('default', '')
+
+
+def get_service_type(f):
+    """Retrieves service type from function."""
+    return getattr(f, 'service_type', None)
+
+
+def unauthenticated(func):
+    """Adds 'unauthenticated' attribute to decorated function.
+
+    Usage:
+
+    >>> @unauthenticated
+    ... def mymethod(f):
+    ...     pass
+    """
+    func.unauthenticated = True
+    return func
+
+
+def isunauthenticated(func):
+    """Checks if the function does not require authentication.
+
+    Mark such functions with the `@unauthenticated` decorator.
+
+    :returns: bool
+    """
+    return getattr(func, 'unauthenticated', False)
+
+
+def arg(*args, **kwargs):
+    """Decorator for CLI args.
+
+    Example:
+
+    >>> @arg("name", help="Name of the new entity")
+    ... def entity_create(args):
+    ...     pass
+    """
+    def _decorator(func):
+        add_arg(func, *args, **kwargs)
+        return func
+    return _decorator
+
+
+def add_arg(func, *args, **kwargs):
+    """Bind CLI arguments to a shell.py `do_foo` function."""
+
+    if not hasattr(func, 'arguments'):
+        func.arguments = []
+
+    # NOTE(sirp): avoid dups that can occur when the module is shared across
+    # tests.
+    if (args, kwargs) not in func.arguments:
+        # Because of the semantics of decorator composition if we just append
+        # to the options list positional options will appear to be backwards.
+        func.arguments.insert(0, (args, kwargs))
+
+
+def service_type(stype):
+    """Adds 'service_type' attribute to decorated function.
+    Usage:
+    .. code-block:: python
+       @service_type('volume')
+       def mymethod(f):
+       ...
+    """
+    def inner(f):
+        f.service_type = stype
+        return f
+    return inner
 
 
 def add_resource_manager_extra_kwargs_hook(f, hook):
@@ -67,10 +153,13 @@ def get_resource_manager_extra_kwargs(f, args, allow_conflicts=False):
     return extra_kwargs
 
 
+def pretty_choice_list(l):
+    return ', '.join("'%s'" % i for i in l)
+
+
 def pretty_choice_dict(d):
     """Returns a formatted dict as 'key=value'."""
-    return cliutils.pretty_choice_list(
-        ['%s=%s' % (k, d[k]) for k in sorted(d.keys())])
+    return pretty_choice_list(['%s=%s' % (k, d[k]) for k in sorted(d.keys())])
 
 
 def print_list(objs, fields, formatters={}, sortby_index=None):
@@ -95,6 +184,8 @@ def print_list(objs, fields, formatters={}, sortby_index=None):
                 data = getattr(o, field_name, '')
                 if data is None:
                     data = '-'
+                # '\r' would break the table, so remove it.
+                data = six.text_type(data).replace("\r", "")
                 row.append(data)
         pt.add_row(row)
 
@@ -119,7 +210,7 @@ def _flatten(data, prefix=None):
     if isinstance(data, dict):
         for key, value in six.iteritems(data):
             new_key = '%s_%s' % (prefix, key) if prefix else key
-            if isinstance(value, (dict, list)):
+            if isinstance(value, (dict, list)) and value:
                 for item in _flatten(value, new_key):
                     yield item
             else:
@@ -158,10 +249,13 @@ def print_dict(d, dict_property="Property", dict_value="Value", wrap=0):
         if isinstance(v, (dict, list)):
             v = jsonutils.dumps(v)
         if wrap > 0:
-            v = textwrap.fill(str(v), wrap)
+            v = textwrap.fill(six.text_type(v), wrap)
         # if value has a newline, add in multiple rows
         # e.g. fault with stacktrace
-        if v and isinstance(v, six.string_types) and r'\n' in v:
+        if v and isinstance(v, six.string_types) and (r'\n' in v or '\r' in v):
+            # '\r' would break the table, so remove it.
+            if '\r' in v:
+                v = v.replace('\r', '')
             lines = v.strip().split(r'\n')
             col1 = k
             for line in lines:
@@ -180,22 +274,17 @@ def print_dict(d, dict_property="Property", dict_value="Value", wrap=0):
     print(result)
 
 
-def find_resource(manager, name_or_id, **find_args):
+def find_resource(manager, name_or_id, wrap_exception=True, **find_args):
     """Helper for the _find_* methods."""
-    # for str id which is not uuid (for Flavor and Keypair search currently)
+    # for str id which is not uuid (for Flavor, Keypair and hypervsior in cells
+    # environments search currently)
     if getattr(manager, 'is_alphanum_id_allowed', False):
         try:
             return manager.get(name_or_id)
         except exceptions.NotFound:
             pass
 
-    # try to get entity as integer id
-    try:
-        return manager.get(int(name_or_id))
-    except (TypeError, ValueError, exceptions.NotFound):
-        pass
-
-    # now try to get entity as uuid
+    # first try to get entity as uuid
     try:
         tmp_id = encodeutils.safe_encode(name_or_id)
 
@@ -207,6 +296,7 @@ def find_resource(manager, name_or_id, **find_args):
     except (TypeError, ValueError, exceptions.NotFound):
         pass
 
+    # then try to get entity as name
     try:
         try:
             resource = getattr(manager, 'resource_class', None)
@@ -217,23 +307,33 @@ def find_resource(manager, name_or_id, **find_args):
         except exceptions.NotFound:
             pass
 
-        # finally try to find entity by human_id
+        # then try to find entity by human_id
         try:
             return manager.find(human_id=name_or_id, **find_args)
         except exceptions.NotFound:
-            msg = (_("No %(class)s with a name or ID of '%(name)s' exists.") %
-                   {'class': manager.resource_class.__name__.lower(),
-                    'name': name_or_id})
-            raise exceptions.CommandError(msg)
+            pass
     except exceptions.NoUniqueMatch:
         msg = (_("Multiple %(class)s matches found for '%(name)s', use an ID "
                  "to be more specific.") %
                {'class': manager.resource_class.__name__.lower(),
                 'name': name_or_id})
-        raise exceptions.CommandError(msg)
+        if wrap_exception:
+            raise exceptions.CommandError(msg)
+        raise exceptions.NoUniqueMatch(msg)
+
+    # finally try to get entity as integer id
+    try:
+        return manager.get(int(name_or_id))
+    except (TypeError, ValueError, exceptions.NotFound):
+        msg = (_("No %(class)s with a name or ID of '%(name)s' exists.") %
+               {'class': manager.resource_class.__name__.lower(),
+                'name': name_or_id})
+        if wrap_exception:
+            raise exceptions.CommandError(msg)
+        raise exceptions.NotFound(404, msg)
 
 
-def _format_servers_list_networks(server):
+def format_servers_list_networks(server):
     output = []
     for (network, addresses) in server.networks.items():
         if len(addresses) == 0:
@@ -245,7 +345,7 @@ def _format_servers_list_networks(server):
     return '; '.join(output)
 
 
-def _format_security_groups(groups):
+def format_security_groups(groups):
     return ', '.join(group['name'] for group in groups)
 
 
@@ -261,7 +361,7 @@ def _format_field_name(attr):
     return ': '.join(parts)
 
 
-def _make_field_formatter(attr, filters=None):
+def make_field_formatter(attr, filters=None):
     """
     Given an object attribute, return a formatted field name and a
     formatter suitable for passing to print_list.
@@ -313,11 +413,18 @@ def do_action_on_many(action, resources, success_msg, error_msg):
         raise exceptions.CommandError(error_msg)
 
 
-def _load_entry_point(ep_name, name=None):
+def load_entry_point(ep_name, name=None):
     """Try to load the entry point ep_name that matches name."""
     for ep in pkg_resources.iter_entry_points(ep_name, name=name):
         try:
-            return ep.load()
+            # FIXME(dhellmann): It would be better to use stevedore
+            # here, since it abstracts this difference in behavior
+            # between versions of setuptools, but this seemed like a
+            # more expedient fix.
+            if hasattr(ep, 'resolve') and hasattr(ep, 'require'):
+                return ep.resolve()
+            else:
+                return ep.load(require=False)
         except (ImportError, pkg_resources.UnknownExtra, AttributeError):
             continue
 
@@ -339,3 +446,29 @@ def validate_flavor_metadata_keys(keys):
                     'numbers, spaces, underscores, periods, colons and '
                     'hyphens.')
             raise exceptions.CommandError(msg % key)
+
+
+@contextlib.contextmanager
+def record_time(times, enabled, *args):
+    """Record the time of a specific action.
+
+    :param times: A list of tuples holds time data.
+    :type times: list
+    :param enabled: Whether timing is enabled.
+    :type enabled: bool
+    :param *args: Other data to be stored besides time data, these args
+                  will be joined to a string.
+    """
+    if not enabled:
+        yield
+    else:
+        start = time.time()
+        yield
+        end = time.time()
+        times.append((' '.join(args), start, end))
+
+
+def prepare_query_string(params):
+    """Convert dict params to query string"""
+    params = sorted(params.items(), key=lambda x: x[0])
+    return '?%s' % parse.urlencode(params) if params else ''

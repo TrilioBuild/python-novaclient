@@ -12,44 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from novaclient import api_versions
 from novaclient import base
 from novaclient.i18n import _
-from novaclient.openstack.common import cliutils
 from novaclient import utils
+from novaclient.v2 import shell
 
 
 class TenantNetwork(base.Resource):
     def delete(self):
-        self.manager.delete(network=self)
+        """
+        DEPRECATED: Delete this project network.
+
+        :returns: An instance of novaclient.base.TupleWithMeta
+        """
+        return self.manager.delete(network=self)
 
 
 class TenantNetworkManager(base.ManagerWithFind):
+    """DEPRECATED"""
     resource_class = base.Resource
 
+    @api_versions.deprecated_after('2.35')
     def list(self):
+        """DEPRECATED"""
         return self._list('/os-tenant-networks', 'networks')
 
+    @api_versions.deprecated_after('2.35')
     def get(self, network):
+        """DEPRECATED"""
         return self._get('/os-tenant-networks/%s' % base.getid(network),
                          'network')
 
+    @api_versions.deprecated_after('2.35')
     def delete(self, network):
-        self._delete('/os-tenant-networks/%s' % base.getid(network))
+        """
+        DEPRECATED: Delete a specified project network.
 
+        :param network: a project network to delete
+        :returns: An instance of novaclient.base.TupleWithMeta
+        """
+        return self._delete('/os-tenant-networks/%s' % base.getid(network))
+
+    @api_versions.deprecated_after('2.35')
     def create(self, label, cidr):
+        """DEPRECATED"""
         body = {'network': {'label': label, 'cidr': cidr}}
         return self._create('/os-tenant-networks', body, 'network')
 
 
-@cliutils.arg('network_id', metavar='<network_id>', help='ID of network')
+@utils.arg('network_id', metavar='<network_id>', help='ID of network')
 def do_net(cs, args):
     """
-    DEPRECATED, Use tenant-network-show instead.
+    DEPRECATED, use tenant-network-show instead.
     """
     do_tenant_network_show(cs, args)
 
 
-@cliutils.arg('network_id', metavar='<network_id>', help='ID of network')
+@utils.arg('network_id', metavar='<network_id>', help='ID of network')
+@shell.deprecated_network
 def do_tenant_network_show(cs, args):
     """
     Show a tenant network.
@@ -65,6 +86,7 @@ def do_net_list(cs, args):
     do_tenant_network_list(cs, args)
 
 
+@shell.deprecated_network
 def do_tenant_network_list(cs, args):
     """
     List tenant networks.
@@ -73,11 +95,11 @@ def do_tenant_network_list(cs, args):
     utils.print_list(networks, ['ID', 'Label', 'CIDR'])
 
 
-@cliutils.arg(
+@utils.arg(
     'label',
     metavar='<network_label>',
     help=_('Network label (ex. my_new_network)'))
-@cliutils.arg(
+@utils.arg(
     'cidr',
     metavar='<cidr>',
     help=_('IP block to allocate from (ex. 172.16.0.0/24 or 2001:DB8::/64)'))
@@ -88,14 +110,15 @@ def do_net_create(cs, args):
     do_tenant_network_create(cs, args)
 
 
-@cliutils.arg(
+@utils.arg(
     'label',
     metavar='<network_label>',
     help=_('Network label (ex. my_new_network)'))
-@cliutils.arg(
+@utils.arg(
     'cidr',
     metavar='<cidr>',
     help=_('IP block to allocate from (ex. 172.16.0.0/24 or 2001:DB8::/64)'))
+@shell.deprecated_network
 def do_tenant_network_create(cs, args):
     """
     Create a tenant network.
@@ -104,7 +127,7 @@ def do_tenant_network_create(cs, args):
     utils.print_dict(network._info)
 
 
-@cliutils.arg('network_id', metavar='<network_id>', help='ID of network')
+@utils.arg('network_id', metavar='<network_id>', help='ID of network')
 def do_net_delete(cs, args):
     """
     DEPRECATED, use tenant-network-delete instead.
@@ -112,7 +135,8 @@ def do_net_delete(cs, args):
     do_tenant_network_delete(cs, args)
 
 
-@cliutils.arg('network_id', metavar='<network_id>', help='ID of network')
+@utils.arg('network_id', metavar='<network_id>', help='ID of network')
+@shell.deprecated_network
 def do_tenant_network_delete(cs, args):
     """
     Delete a tenant network.

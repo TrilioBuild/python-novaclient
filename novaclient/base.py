@@ -21,22 +21,23 @@ Base utilities to build API operation managers and objects on top of.
 
 import abc
 import contextlib
+import copy
 import hashlib
-import inspect
 import os
 import threading
 
+from oslo_utils import reflection
+from oslo_utils import strutils
+from requests import Response
 import six
 
 from novaclient import exceptions
-from novaclient.openstack.common.apiclient import base
-from novaclient.openstack.common import cliutils
-
-Resource = base.Resource
+from novaclient import utils
 
 
 def getid(obj):
-    """
+    """Get object's ID or object.
+
     Abstracts the common pattern of allowing both an object or an object's ID
     as a parameter when dealing with relationships.
     """
@@ -46,8 +47,184 @@ def getid(obj):
         return obj
 
 
-class Manager(base.HookableMixin):
+# TODO(aababilov): call run_hooks() in HookableMixin's child classes
+class HookableMixin(object):
+    """Mixin so classes can register and run hooks."""
+    _hooks_map = {}
+
+    @classmethod
+    def add_hook(cls, hook_type, hook_func):
+        """Add a new hook of specified type.
+
+        :param cls: class that registers hooks
+        :param hook_type: hook type, e.g., '__pre_parse_args__'
+        :param hook_func: hook function
+        """
+        if hook_type not in cls._hooks_map:
+            cls._hooks_map[hook_type] = []
+
+        cls._hooks_map[hook_type].append(hook_func)
+
+    @classmethod
+    def run_hooks(cls, hook_type, *args, **kwargs):
+        """Run all hooks of specified type.
+
+        :param cls: class that registers hooks
+        :param hook_type: hook type, e.g., '__pre_parse_args__'
+        :param args: args to be passed to every hook function
+        :param kwargs: kwargs to be passed to every hook function
+        """
+        hook_funcs = cls._hooks_map.get(hook_type) or []
+        for hook_func in hook_funcs:
+            hook_func(*args, **kwargs)
+
+
+class RequestIdMixin(object):
+    """Wrapper class to expose x-openstack-request-id to the caller.
     """
+    def request_ids_setup(self):
+        self.x_openstack_request_ids = []
+
+    @property
+    def request_ids(self):
+        return self.x_openstack_request_ids
+
+    def append_request_ids(self, resp):
+        """Add request_ids as an attribute to the object
+
+        :param resp: Response object or list of Response objects
+        """
+        if isinstance(resp, list):
+            # Add list of request_ids if response is of type list.
+            for resp_obj in resp:
+                self._append_request_id(resp_obj)
+        elif resp is not None:
+            # Add request_ids if response contains single object.
+            self._append_request_id(resp)
+
+    def _append_request_id(self, resp):
+        if isinstance(resp, Response):
+            # Extract 'x-openstack-request-id' from headers if
+            # response is a Response object.
+            request_id = (resp.headers.get('x-openstack-request-id') or
+                          resp.headers.get('x-compute-request-id'))
+        else:
+            # If resp is of type string or None.
+            request_id = resp
+        if request_id not in self.x_openstack_request_ids:
+            self.x_openstack_request_ids.append(request_id)
+
+
+class Resource(RequestIdMixin):
+    """Base class for OpenStack resources (tenant, user, etc.).
+
+    This is pretty much just a bag for attributes.
+    """
+
+    HUMAN_ID = False
+    NAME_ATTR = 'name'
+
+    def __init__(self, manager, info, loaded=False, resp=None):
+        """Populate and bind to a manager.
+
+        :param manager: BaseManager object
+        :param info: dictionary representing resource attributes
+        :param loaded: prevent lazy-loading if set to True
+        :param resp: Response or list of Response objects
+        """
+        self.manager = manager
+        self._info = info
+        self._add_details(info)
+        self._loaded = loaded
+        self.request_ids_setup()
+        self.append_request_ids(resp)
+
+    def __repr__(self):
+        reprkeys = sorted(k
+                          for k in self.__dict__.keys()
+                          if k[0] != '_' and
+                          k not in ['manager', 'x_openstack_request_ids'])
+        info = ", ".join("%s=%s" % (k, getattr(self, k)) for k in reprkeys)
+        return "<%s %s>" % (self.__class__.__name__, info)
+
+    @property
+    def api_version(self):
+        return self.manager.api_version
+
+    @property
+    def human_id(self):
+        """Human-readable ID which can be used for bash completion.
+        """
+        if self.HUMAN_ID:
+            name = getattr(self, self.NAME_ATTR, None)
+            if name is not None:
+                return strutils.to_slug(name)
+        return None
+
+    def _add_details(self, info):
+        for (k, v) in six.iteritems(info):
+            try:
+                setattr(self, k, v)
+                self._info[k] = v
+            except AttributeError:
+                # In this case we already defined the attribute on the class
+                pass
+
+    def __getattr__(self, k):
+        if k not in self.__dict__:
+            # NOTE(bcwaldon): disallow lazy-loading if already loaded once
+            if not self.is_loaded():
+                self.get()
+                return self.__getattr__(k)
+
+            raise AttributeError(k)
+        else:
+            return self.__dict__[k]
+
+    def get(self):
+        """Support for lazy loading details.
+
+        Some clients, such as novaclient have the option to lazy load the
+        details, details which can be loaded with this function.
+        """
+        # set_loaded() first ... so if we have to bail, we know we tried.
+        self.set_loaded(True)
+        if not hasattr(self.manager, 'get'):
+            return
+
+        new = self.manager.get(self.id)
+        if new:
+            self._add_details(new._info)
+            # The 'request_ids' attribute has been added,
+            # so store the request id to it instead of _info
+            self.append_request_ids(new.request_ids)
+
+    def __eq__(self, other):
+        if not isinstance(other, Resource):
+            return NotImplemented
+        # two resources of different types are not equal
+        if not isinstance(other, self.__class__):
+            return False
+        if hasattr(self, 'id') and hasattr(other, 'id'):
+            return self.id == other.id
+        return self._info == other._info
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def is_loaded(self):
+        return self._loaded
+
+    def set_loaded(self, val):
+        self._loaded = val
+
+    def to_dict(self):
+        return copy.deepcopy(self._info)
+
+
+class Manager(HookableMixin):
+    """Manager for API service.
+
     Managers interact with a particular type of API (servers, flavors, images,
     etc.) and provide CRUD operations for them.
     """
@@ -57,11 +234,19 @@ class Manager(base.HookableMixin):
     def __init__(self, api):
         self.api = api
 
+    @property
+    def client(self):
+        return self.api.client
+
+    @property
+    def api_version(self):
+        return self.api.api_version
+
     def _list(self, url, response_key, obj_class=None, body=None):
         if body:
-            _resp, body = self.api.client.post(url, body=body)
+            resp, body = self.api.client.post(url, body=body)
         else:
-            _resp, body = self.api.client.get(url)
+            resp, body = self.api.client.get(url)
 
         if obj_class is None:
             obj_class = self.resource_class
@@ -77,21 +262,26 @@ class Manager(base.HookableMixin):
 
         with self.completion_cache('human_id', obj_class, mode="w"):
             with self.completion_cache('uuid', obj_class, mode="w"):
-                return [obj_class(self, res, loaded=True)
-                        for res in data if res]
+                items = [obj_class(self, res, loaded=True)
+                         for res in data if res]
+                return ListWithMeta(items, resp)
 
     @contextlib.contextmanager
-    def alternate_service_type(self, service_type):
+    def alternate_service_type(self, default, allowed_types=()):
         original_service_type = self.api.client.service_type
-        self.api.client.service_type = service_type
-        try:
+        if original_service_type in allowed_types:
             yield
-        finally:
-            self.api.client.service_type = original_service_type
+        else:
+            self.api.client.service_type = default
+            try:
+                yield
+            finally:
+                self.api.client.service_type = original_service_type
 
     @contextlib.contextmanager
     def completion_cache(self, cache_type, obj_class, mode):
-        """
+        """The completion cache for bash autocompletion.
+
         The completion cache store items that can be used for bash
         autocompletion, like UUIDs or human-friendly IDs.
 
@@ -105,13 +295,13 @@ class Manager(base.HookableMixin):
         # NOTE(wryan): This lock protects read and write access to the
         # completion caches
         with self.cache_lock:
-            base_dir = cliutils.env('NOVACLIENT_UUID_CACHE_DIR',
-                                    default="~/.novaclient")
+            base_dir = utils.env('NOVACLIENT_UUID_CACHE_DIR',
+                                 default="~/.novaclient")
 
             # NOTE(sirp): Keep separate UUID caches for each username +
             # endpoint pair
-            username = cliutils.env('OS_USERNAME', 'NOVA_USERNAME')
-            url = cliutils.env('OS_URL', 'NOVA_URL')
+            username = utils.env('OS_USERNAME', 'NOVA_USERNAME')
+            url = utils.env('OS_URL', 'NOVA_URL')
             uniqifier = hashlib.md5(username.encode('utf-8') +
                                     url.encode('utf-8')).hexdigest()
 
@@ -153,46 +343,67 @@ class Manager(base.HookableMixin):
             cache.write("%s\n" % val)
 
     def _get(self, url, response_key):
-        _resp, body = self.api.client.get(url)
-        return self.resource_class(self, body[response_key], loaded=True)
+        resp, body = self.api.client.get(url)
+        if response_key is not None:
+            content = body[response_key]
+        else:
+            content = body
+        return self.resource_class(self, content, loaded=True,
+                                   resp=resp)
 
     def _create(self, url, body, response_key, return_raw=False, **kwargs):
         self.run_hooks('modify_body_for_create', body, **kwargs)
-        _resp, body = self.api.client.post(url, body=body)
+        resp, body = self.api.client.post(url, body=body)
         if return_raw:
-            return body[response_key]
+            return self.convert_into_with_meta(body[response_key], resp)
 
         with self.completion_cache('human_id', self.resource_class, mode="a"):
             with self.completion_cache('uuid', self.resource_class, mode="a"):
-                return self.resource_class(self, body[response_key])
+                return self.resource_class(self, body[response_key], resp=resp)
 
     def _delete(self, url):
-        _resp, _body = self.api.client.delete(url)
+        resp, body = self.api.client.delete(url)
+        return self.convert_into_with_meta(body, resp)
 
     def _update(self, url, body, response_key=None, **kwargs):
         self.run_hooks('modify_body_for_update', body, **kwargs)
-        _resp, body = self.api.client.put(url, body=body)
+        resp, body = self.api.client.put(url, body=body)
         if body:
             if response_key:
-                return self.resource_class(self, body[response_key])
+                return self.resource_class(self, body[response_key], resp=resp)
             else:
-                return self.resource_class(self, body)
+                return self.resource_class(self, body, resp=resp)
+        else:
+            return StrWithMeta(body, resp)
+
+    def convert_into_with_meta(self, item, resp):
+        if isinstance(item, six.string_types):
+            if six.PY2 and isinstance(item, six.text_type):
+                return UnicodeWithMeta(item, resp)
+            else:
+                return StrWithMeta(item, resp)
+        elif isinstance(item, six.binary_type):
+            return BytesWithMeta(item, resp)
+        elif isinstance(item, list):
+            return ListWithMeta(item, resp)
+        elif isinstance(item, tuple):
+            return TupleWithMeta(item, resp)
+        elif item is None:
+            return TupleWithMeta((), resp)
+        else:
+            return DictWithMeta(item, resp)
 
 
 @six.add_metaclass(abc.ABCMeta)
 class ManagerWithFind(Manager):
-    """
-    Like a `Manager`, but with additional `find()`/`findall()` methods.
-    """
+    """Like a `Manager`, but with additional `find()`/`findall()` methods."""
 
     @abc.abstractmethod
     def list(self):
         pass
 
     def find(self, **kwargs):
-        """
-        Find a single item with attributes matching ``**kwargs``.
-        """
+        """Find a single item with attributes matching ``**kwargs``."""
         matches = self.findall(**kwargs)
         num_matches = len(matches)
         if num_matches == 0:
@@ -201,26 +412,25 @@ class ManagerWithFind(Manager):
         elif num_matches > 1:
             raise exceptions.NoUniqueMatch
         else:
+            matches[0].append_request_ids(matches.request_ids)
             return matches[0]
 
     def findall(self, **kwargs):
-        """
-        Find all items with attributes matching ``**kwargs``.
-        """
-        found = []
+        """Find all items with attributes matching ``**kwargs``."""
+        found = ListWithMeta([], None)
         searches = kwargs.items()
 
         detailed = True
         list_kwargs = {}
 
-        list_argspec = inspect.getargspec(self.list)
-        if 'detailed' in list_argspec.args:
+        list_argspec = reflection.get_callable_args(self.list)
+        if 'detailed' in list_argspec:
             detailed = ("human_id" not in kwargs and
                         "name" not in kwargs and
                         "display_name" not in kwargs)
             list_kwargs['detailed'] = detailed
 
-        if 'is_public' in list_argspec.args and 'is_public' in kwargs:
+        if 'is_public' in list_argspec and 'is_public' in kwargs:
             is_public = kwargs['is_public']
             list_kwargs['is_public'] = is_public
             if is_public is None:
@@ -228,7 +438,7 @@ class ManagerWithFind(Manager):
                 del tmp_kwargs['is_public']
                 searches = tmp_kwargs.items()
 
-        if 'search_opts' in list_argspec.args:
+        if 'search_opts' in list_argspec:
             # pass search_opts in to do server side based filtering.
             # TODO(jogo) not all search_opts support regex, find way to
             # identify when to use regex and when to use string matching.
@@ -245,8 +455,13 @@ class ManagerWithFind(Manager):
                 all_tenants = kwargs['all_tenants']
                 list_kwargs['search_opts']['all_tenants'] = all_tenants
                 searches = [(k, v) for k, v in searches if k != 'all_tenants']
+            if "deleted" in kwargs:
+                deleted = kwargs['deleted']
+                list_kwargs['search_opts']['deleted'] = deleted
+                searches = [(k, v) for k, v in searches if k != 'deleted']
 
         listing = self.list(**list_kwargs)
+        found.append_request_ids(listing.request_ids)
 
         for obj in listing:
             try:
@@ -255,7 +470,9 @@ class ManagerWithFind(Manager):
                     if detailed:
                         found.append(obj)
                     else:
-                        found.append(self.get(obj.id))
+                        detail = self.get(obj.id)
+                        found.append(detail)
+                        found.append_request_ids(detail.request_ids)
             except AttributeError:
                 continue
 
@@ -266,6 +483,9 @@ class BootingManagerWithFind(ManagerWithFind):
     """Like a `ManagerWithFind`, but has the ability to boot servers."""
 
     def _parse_block_device_mapping(self, block_device_mapping):
+        """Parses legacy block device mapping."""
+        # FIXME(andreykurilin): make it work with block device mapping v2
+
         bdm = []
 
         for device_name, mapping in six.iteritems(block_device_mapping):
@@ -277,15 +497,11 @@ class BootingManagerWithFind(ManagerWithFind):
 
             mapping_parts = mapping.split(':')
             source_id = mapping_parts[0]
-            bdm_dict['uuid'] = source_id
-            bdm_dict['boot_index'] = 0
+
             if len(mapping_parts) == 1:
                 bdm_dict['volume_id'] = source_id
-                bdm_dict['source_type'] = 'volume'
-
             elif len(mapping_parts) > 1:
                 source_type = mapping_parts[1]
-                bdm_dict['source_type'] = source_type
                 if source_type.startswith('snap'):
                     bdm_dict['snapshot_id'] = source_id
                 else:
@@ -303,3 +519,54 @@ class BootingManagerWithFind(ManagerWithFind):
             bdm_dict.pop('boot_index')
             bdm.append(bdm_dict)
         return bdm
+
+
+class ListWithMeta(list, RequestIdMixin):
+    def __init__(self, values, resp):
+        super(ListWithMeta, self).__init__(values)
+        self.request_ids_setup()
+        self.append_request_ids(resp)
+
+
+class DictWithMeta(dict, RequestIdMixin):
+    def __init__(self, values, resp):
+        super(DictWithMeta, self).__init__(values)
+        self.request_ids_setup()
+        self.append_request_ids(resp)
+
+
+class TupleWithMeta(tuple, RequestIdMixin):
+    def __new__(cls, values, resp):
+        return super(TupleWithMeta, cls).__new__(cls, values)
+
+    def __init__(self, values, resp):
+        self.request_ids_setup()
+        self.append_request_ids(resp)
+
+
+class StrWithMeta(str, RequestIdMixin):
+    def __new__(cls, value, resp):
+        return super(StrWithMeta, cls).__new__(cls, value)
+
+    def __init__(self, values, resp):
+        self.request_ids_setup()
+        self.append_request_ids(resp)
+
+
+class BytesWithMeta(six.binary_type, RequestIdMixin):
+    def __new__(cls, value, resp):
+        return super(BytesWithMeta, cls).__new__(cls, value)
+
+    def __init__(self, values, resp):
+        self.request_ids_setup()
+        self.append_request_ids(resp)
+
+
+if six.PY2:
+    class UnicodeWithMeta(six.text_type, RequestIdMixin):
+        def __new__(cls, value, resp):
+            return super(UnicodeWithMeta, cls).__new__(cls, value)
+
+        def __init__(self, values, resp):
+            self.request_ids_setup()
+            self.append_request_ids(resp)

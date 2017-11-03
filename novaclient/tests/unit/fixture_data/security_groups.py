@@ -10,7 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 
 from novaclient.tests.unit import fakes
 from novaclient.tests.unit.fixture_data import base
@@ -62,7 +62,7 @@ class Fixture(base.Fixture):
         }
 
         get_groups = {'security_groups': [security_group_1, security_group_2]}
-        headers = {'Content-Type': 'application/json'}
+        headers = self.json_headers
 
         self.requests.register_uri('GET', self.url(),
                                    json=get_groups,
@@ -73,7 +73,8 @@ class Fixture(base.Fixture):
                                    json=get_group_1,
                                    headers=headers)
 
-        self.requests.register_uri('DELETE', self.url(1), status_code=202)
+        self.requests.register_uri('DELETE', self.url(1), status_code=202,
+                                   headers=headers)
 
         def post_os_security_groups(request, context):
             body = jsonutils.loads(request.body)

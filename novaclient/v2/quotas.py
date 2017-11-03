@@ -32,23 +32,25 @@ class QuotaSet(base.Resource):
 class QuotaSetManager(base.Manager):
     resource_class = QuotaSet
 
-    def get(self, tenant_id, user_id=None):
+    def get(self, tenant_id, user_id=None, detail=False):
+        url = '/os-quota-sets/%(tenant_id)s'
+        if detail:
+            url += '/detail'
+
         if hasattr(tenant_id, 'tenant_id'):
             tenant_id = tenant_id.tenant_id
         if user_id:
-            url = '/os-quota-sets/%s?user_id=%s' % (tenant_id, user_id)
+            params = {'tenant_id': tenant_id, 'user_id': user_id}
+            url += '?user_id=%(user_id)s'
         else:
-            url = '/os-quota-sets/%s' % tenant_id
-        return self._get(url, "quota_set")
+            params = {'tenant_id': tenant_id}
 
-    def _update_body(self, tenant_id, **kwargs):
-        kwargs['tenant_id'] = tenant_id
-        return {'quota_set': kwargs}
+        return self._get(url % params, "quota_set")
 
     def update(self, tenant_id, **kwargs):
 
         user_id = kwargs.pop('user_id', None)
-        body = self._update_body(tenant_id, **kwargs)
+        body = {'quota_set': kwargs}
 
         for key in list(body['quota_set']):
             if body['quota_set'][key] is None:
@@ -65,8 +67,15 @@ class QuotaSetManager(base.Manager):
                          'quota_set')
 
     def delete(self, tenant_id, user_id=None):
+        """
+        Delete quota for a tenant or for a user.
+
+        :param tenant_id: A tenant for which quota is to be deleted
+        :param user_id: A user for which quota is to be deleted
+        :returns: An instance of novaclient.base.TupleWithMeta
+        """
         if user_id:
             url = '/os-quota-sets/%s?user_id=%s' % (tenant_id, user_id)
         else:
             url = '/os-quota-sets/%s' % tenant_id
-        self._delete(url)
+        return self._delete(url)

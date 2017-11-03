@@ -13,27 +13,35 @@
 """
 Security group default rules interface.
 """
-
+from novaclient import api_versions
 from novaclient import base
 from novaclient import exceptions
 from novaclient.i18n import _
 
 
 class SecurityGroupDefaultRule(base.Resource):
+    """DEPRECATED"""
     def __str__(self):
         return str(self.id)
 
     def delete(self):
-        self.manager.delete(self)
+        """
+        DEPRECATED: Delete this security group default rule.
+
+        :returns: An instance of novaclient.base.TupleWithMeta
+        """
+        return self.manager.delete(self)
 
 
 class SecurityGroupDefaultRuleManager(base.Manager):
+    """DEPRECATED"""
     resource_class = SecurityGroupDefaultRule
 
+    @api_versions.deprecated_after('2.35')
     def create(self, ip_protocol=None, from_port=None, to_port=None,
                cidr=None):
         """
-        Create a security group default rule
+        DEPRECATED: Create a security group default rule
 
         :param ip_protocol: IP protocol, one of 'tcp', 'udp' or 'icmp'
         :param from_port: Source port
@@ -62,17 +70,21 @@ class SecurityGroupDefaultRuleManager(base.Manager):
         return self._create('/os-security-group-default-rules', body,
                             'security_group_default_rule')
 
+    @api_versions.deprecated_after('2.35')
     def delete(self, rule):
         """
-        Delete a security group default rule
+        DEPRECATED: Delete a security group default rule
 
         :param rule: The security group default rule to delete (ID or Class)
+        :returns: An instance of novaclient.base.TupleWithMeta
         """
-        self._delete('/os-security-group-default-rules/%s' % base.getid(rule))
+        return self._delete('/os-security-group-default-rules/%s' %
+                            base.getid(rule))
 
+    @api_versions.deprecated_after('2.35')
     def list(self):
         """
-        Get a list of all security group default rules
+        DEPRECATED: Get a list of all security group default rules
 
         :rtype: list of :class:`SecurityGroupDefaultRule`
         """

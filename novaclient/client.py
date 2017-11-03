@@ -22,17 +22,22 @@ OpenStack Client interface. Handles the REST calls and responses.
 
 import copy
 import functools
+import glob
 import hashlib
+import imp
+import itertools
 import logging
+import os
+import pkgutil
 import re
-import socket
-import time
+import warnings
 
-from keystoneclient import adapter
-from oslo.utils import importutils
-from oslo.utils import netutils
+from keystoneauth1 import adapter
+from keystoneauth1 import session
+from oslo_utils import importutils
+from oslo_utils import netutils
+import pkg_resources
 import requests
-from requests import adapters
 
 try:
     import json
@@ -41,20 +46,18 @@ except ImportError:
 
 from six.moves.urllib import parse
 
+from novaclient import api_versions
 from novaclient import exceptions
-from novaclient.i18n import _
+from novaclient import extension as ext
+from novaclient.i18n import _, _LW
 from novaclient import service_catalog
+from novaclient import utils
 
 
-class TCPKeepAliveAdapter(adapters.HTTPAdapter):
-    """The custom adapter used to set TCP Keep-Alive on all connections."""
-    def init_poolmanager(self, *args, **kwargs):
-        if requests.__version__ >= '2.4.1':
-            kwargs.setdefault('socket_options', [
-                (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
-                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-            ])
-        super(TCPKeepAliveAdapter, self).init_poolmanager(*args, **kwargs)
+# TODO(jichenjc): when an extension in contrib is moved to core extension,
+# Add the name into the following list, then after last patch merged,
+# remove the whole function
+extensions_ignored_name = ["__init__"]
 
 
 class _ClientConnectionPool(object):
@@ -63,35 +66,53 @@ class _ClientConnectionPool(object):
         self._adapters = {}
 
     def get(self, url):
-        """
-        Store and reuse HTTP adapters per Service URL.
-        """
+        """Store and reuse HTTP adapters per Service URL."""
         if url not in self._adapters:
-            self._adapters[url] = TCPKeepAliveAdapter()
+            self._adapters[url] = session.TCPKeepAliveAdapter()
 
         return self._adapters[url]
+
+
+def _log_request_id(logger, resp, service_name):
+    request_id = (resp.headers.get('x-openstack-request-id') or
+                  resp.headers.get('x-compute-request-id'))
+    if request_id:
+        logger.debug('%(method)s call to %(service_name)s for %(url)s '
+                     'used request id %(response_request_id)s',
+                     {'method': resp.request.method,
+                      'service_name': service_name,
+                      'url': resp.url,
+                      'response_request_id': request_id})
 
 
 class SessionClient(adapter.LegacyJsonAdapter):
 
     def __init__(self, *args, **kwargs):
         self.times = []
+        self.timings = kwargs.pop('timings', False)
+        self.api_version = kwargs.pop('api_version', None)
+        self.api_version = self.api_version or api_versions.APIVersion()
         super(SessionClient, self).__init__(*args, **kwargs)
 
     def request(self, url, method, **kwargs):
+        kwargs.setdefault('headers', kwargs.get('headers', {}))
+        api_versions.update_headers(kwargs["headers"], self.api_version)
         # NOTE(jamielennox): The standard call raises errors from
-        # keystoneclient, where we need to raise the novaclient errors.
+        # keystoneauth1, where we need to raise the novaclient errors.
         raise_exc = kwargs.pop('raise_exc', True)
-        start_time = time.time()
-        resp, body = super(SessionClient, self).request(url,
-                                                        method,
-                                                        raise_exc=False,
-                                                        **kwargs)
+        with utils.record_time(self.times, self.timings, method, url):
+            resp, body = super(SessionClient, self).request(url,
+                                                            method,
+                                                            raise_exc=False,
+                                                            **kwargs)
 
-        end_time = time.time()
-        self.times.append(('%s %s' % (method, url),
-                          start_time, end_time))
+        # if service name is None then use service_type for logging
+        service = self.service_name or self.service_type
+        _log_request_id(self.logger, resp, service)
 
+        # TODO(andreykurilin): uncomment this line, when we will be able to
+        #   check only nova-related calls
+        # api_versions.check_headers(resp, self.api_version)
         if raise_exc and resp.status_code >= 400:
             raise exceptions.from_response(resp, body, url, method)
 
@@ -105,9 +126,10 @@ class SessionClient(adapter.LegacyJsonAdapter):
 
 
 def _original_only(f):
-    """Indicates and enforces that this function can only be used if we are
-    using the original HTTPClient object.
+    """Decorator to indicate and enforce original HTTPClient object.
 
+    Indicates and enforces that this function can only be used if we are
+    using the original HTTPClient object.
     We use this to specify that if you use the newer Session HTTP client then
     you are aware that the way you use your client has been updated and certain
     functions are no longer allowed to be used.
@@ -138,12 +160,14 @@ class HTTPClient(object):
                  http_log_debug=False, auth_system='keystone',
                  auth_plugin=None, auth_token=None,
                  cacert=None, tenant_id=None, user_id=None,
-                 connection_pool=False):
+                 connection_pool=False, api_version=None,
+                 logger=None):
         self.user = user
         self.user_id = user_id
         self.password = password
         self.projectid = projectid
         self.tenant_id = tenant_id
+        self.api_version = api_version or api_versions.APIVersion()
 
         self._connection_pool = (_ClientConnectionPool()
                                  if connection_pool else None)
@@ -200,9 +224,10 @@ class HTTPClient(object):
         self.auth_plugin = auth_plugin
         self._session = None
         self._current_url = None
-        self._logger = logging.getLogger(__name__)
+        self._logger = logger or logging.getLogger(__name__)
 
-        if self.http_log_debug and not self._logger.handlers:
+        if (self.http_log_debug and logger is None and
+                not self._logger.handlers):
             # Logging level is already set on the root logger
             ch = logging.StreamHandler()
             self._logger.addHandler(ch)
@@ -215,10 +240,9 @@ class HTTPClient(object):
                 # otherwise we will get all the requests logging messages
                 rql.setLevel(logging.WARNING)
 
-        # NOTE(melwitt): Service catalog is only set if bypass_url isn't
-        #                used. Otherwise, we can cache using services_url.
         self.service_catalog = None
         self.services_url = {}
+        self.last_request_id = None
 
     def use_token_cache(self, use_it):
         self.os_cache = use_it
@@ -267,7 +291,7 @@ class HTTPClient(object):
         if key in target:
             if text:
                 target[key] = text
-            else:
+            elif target[key] is not None:
                 # because in python3 byte string handling is ... ug
                 value = target[key].encode('utf-8')
                 sha1sum = hashlib.sha1(value)
@@ -318,6 +342,10 @@ class HTTPClient(object):
                                           'headers': resp.headers,
                                           'text': json.dumps(body)})
 
+        # if service name is None then use service_type for logging
+        service = self.service_name or self.service_type
+        _log_request_id(self._logger, resp, service)
+
     def open_session(self):
         if not self._connection_pool:
             self._session = requests.Session()
@@ -352,8 +380,8 @@ class HTTPClient(object):
         kwargs['headers']['Accept'] = 'application/json'
         if 'body' in kwargs:
             kwargs['headers']['Content-Type'] = 'application/json'
-            kwargs['data'] = json.dumps(kwargs['body'])
-            del kwargs['body']
+            kwargs['data'] = json.dumps(kwargs.pop('body'))
+        api_versions.update_headers(kwargs["headers"], self.api_version)
         if self.timeout is not None:
             kwargs.setdefault('timeout', self.timeout)
         kwargs['verify'] = self.verify_cert
@@ -369,6 +397,10 @@ class HTTPClient(object):
             method,
             url,
             **kwargs)
+
+        # TODO(andreykurilin): uncomment this line, when we will be able to
+        #   check only nova-related calls
+        # api_versions.check_headers(resp, self.api_version)
 
         self.http_log_resp(resp)
 
@@ -390,16 +422,16 @@ class HTTPClient(object):
         else:
             body = None
 
+        self.last_request_id = (resp.headers.get('x-openstack-request-id')
+                                if resp.headers else None)
         if resp.status_code >= 400:
             raise exceptions.from_response(resp, body, url, method)
 
         return resp, body
 
     def _time_request(self, url, method, **kwargs):
-        start_time = time.time()
-        resp, body = self.request(url, method, **kwargs)
-        self.times.append(("%s %s" % (method, url),
-                           start_time, time.time()))
+        with utils.record_time(self.times, self.timings, method, url):
+            resp, body = self.request(url, method, **kwargs)
         return resp, body
 
     def _cs_request(self, url, method, **kwargs):
@@ -410,14 +442,12 @@ class HTTPClient(object):
             # a nova endpoint directly without "v2/<tenant-id>".
             magic_tuple = parse.urlsplit(self.management_url)
             scheme, netloc, path, query, frag = magic_tuple
-            path = re.sub(r'v[1-9]/[a-z0-9]+$', '', path)
+            path = re.sub(r'v[1-9](\.[1-9][0-9]*)?/[a-z0-9]+$', '', path)
             url = parse.urlunsplit((scheme, netloc, path, None, None))
         else:
-            if self.service_catalog:
+            if self.service_catalog and not self.bypass_url:
                 url = self.get_service_url(self.service_type) + url
             else:
-                # NOTE(melwitt): The service catalog is not available
-                #                when bypass_url is used.
                 url = self.management_url + url
 
         # Perform the request once. If we get a 401 back then it
@@ -475,7 +505,9 @@ class HTTPClient(object):
         return self.services_url[service_type]
 
     def _extract_service_catalog(self, url, resp, body, extract_token=True):
-        """See what the auth service told us and process the response.
+        """Extract service catalog from input resource body.
+
+        See what the auth service told us and process the response.
         We may get redirected to another site, fail or actually get
         back a service catalog with a token and our endpoints.
         """
@@ -536,7 +568,9 @@ class HTTPClient(object):
             raise exceptions.from_response(resp, body, url)
 
     def _fetch_endpoints_from_auth(self, url):
-        """We have a token, but don't know the final endpoint for
+        """Fetch endpoint using token.
+
+        We have a token, but don't know the final endpoint for
         the region. We have to go back to the auth service and
         ask again. This request requires an admin-level token
         to work. The proxy token supplied could be from a low-level enduser.
@@ -627,9 +661,9 @@ class HTTPClient(object):
 
     def _save_keys(self):
         # Store the token/mgmt url in the keyring for later requests.
-        if (self.keyring_saver and self.os_cache and not self.keyring_saved
-                and self.auth_token and self.management_url
-                and self.tenant_id):
+        if (self.keyring_saver and self.os_cache and not self.keyring_saved and
+                self.auth_token and self.management_url and
+                self.tenant_id):
             self.keyring_saver.save(self.auth_token,
                                     self.management_url,
                                     self.tenant_id)
@@ -735,7 +769,9 @@ def _construct_http_client(username=None, password=None, project_id=None,
                            auth_token=None, cacert=None, tenant_id=None,
                            user_id=None, connection_pool=False, session=None,
                            auth=None, user_agent='python-novaclient',
-                           interface=None, **kwargs):
+                           interface=None, api_version=None, **kwargs):
+    # TODO(mordred): If not session, just make a Session, then return
+    # SessionClient always
     if session:
         return SessionClient(session=session,
                              auth=auth,
@@ -744,10 +780,13 @@ def _construct_http_client(username=None, password=None, project_id=None,
                              region_name=region_name,
                              service_name=service_name,
                              user_agent=user_agent,
+                             timings=timings,
+                             api_version=api_version,
                              **kwargs)
     else:
         # FIXME(jamielennox): username and password are now optional. Need
         # to test that they were provided in this mode.
+        logger = kwargs.get('logger')
         return HTTPClient(username,
                           password,
                           user_id=user_id,
@@ -772,26 +811,118 @@ def _construct_http_client(username=None, password=None, project_id=None,
                           os_cache=os_cache,
                           http_log_debug=http_log_debug,
                           cacert=cacert,
-                          connection_pool=connection_pool)
+                          connection_pool=connection_pool,
+                          api_version=api_version,
+                          logger=logger)
+
+
+def discover_extensions(version, only_contrib=False):
+    """Returns the list of extensions, which can be discovered by python path,
+    contrib path and by entry-point 'novaclient.extension'.
+
+    :param version: api version
+    :type version: str or novaclient.api_versions.APIVersion
+    :param only_contrib: search only in contrib directory or not
+    :type only_contrib: bool
+    """
+    if not isinstance(version, api_versions.APIVersion):
+        version = api_versions.get_api_version(version)
+    if only_contrib:
+        chain = _discover_via_contrib_path(version)
+    else:
+        chain = itertools.chain(_discover_via_python_path(),
+                                _discover_via_contrib_path(version),
+                                _discover_via_entry_points())
+    return [ext.Extension(name, module) for name, module in chain]
+
+
+def _discover_via_python_path():
+    for (module_loader, name, _ispkg) in pkgutil.iter_modules():
+        if name.endswith('_python_novaclient_ext'):
+            # NOTE(sdague): needed for python 2.x compatibility.
+            if not hasattr(module_loader, 'load_module'):
+                module_loader = module_loader.find_module(name)
+            module = module_loader.load_module(name)
+            if hasattr(module, 'extension_name'):
+                name = module.extension_name
+
+            yield name, module
+
+
+def _discover_via_contrib_path(version):
+    module_path = os.path.dirname(os.path.abspath(__file__))
+    ext_path = os.path.join(module_path, "v%s" % version.ver_major, 'contrib')
+    ext_glob = os.path.join(ext_path, "*.py")
+
+    for ext_path in glob.iglob(ext_glob):
+        name = os.path.basename(ext_path)[:-3]
+
+        if name in extensions_ignored_name:
+            continue
+
+        module = imp.load_source(name, ext_path)
+        yield name, module
+
+
+def _discover_via_entry_points():
+    for ep in pkg_resources.iter_entry_points('novaclient.extension'):
+        name = ep.name
+        module = ep.load()
+
+        yield name, module
+
+
+def _get_client_class_and_version(version):
+    if not isinstance(version, api_versions.APIVersion):
+        version = api_versions.get_api_version(version)
+    else:
+        api_versions.check_major_version(version)
+    if version.is_latest():
+        raise exceptions.UnsupportedVersion(
+            _("The version should be explicit, not latest."))
+    return version, importutils.import_class(
+        "novaclient.v%s.client.Client" % version.ver_major)
 
 
 def get_client_class(version):
-    version_map = {
-        '1.1': 'novaclient.v2.client.Client',
-        '2': 'novaclient.v2.client.Client',
-        '3': 'novaclient.v2.client.Client',
-    }
-    try:
-        client_path = version_map[str(version)]
-    except (KeyError, ValueError):
-        msg = _("Invalid client version '%(version)s'. must be one of: "
-                "%(keys)s") % {'version': version,
-                               'keys': ', '.join(version_map.keys())}
-        raise exceptions.UnsupportedVersion(msg)
-
-    return importutils.import_class(client_path)
+    """Returns Client class based on given version."""
+    warnings.warn(_LW("'get_client_class' is deprecated. "
+                      "Please use `novaclient.client.Client` instead."))
+    _api_version, client_class = _get_client_class_and_version(version)
+    return client_class
 
 
-def Client(version, *args, **kwargs):
-    client_class = get_client_class(version)
-    return client_class(*args, **kwargs)
+def Client(version, username=None, api_key=None, project_id=None,
+           auth_url=None, *args, **kwargs):
+    """Initialize client object based on given version.
+
+    HOW-TO:
+    The simplest way to create a client instance is initialization with your
+    credentials::
+
+        >>> from novaclient import client
+        >>> nova = client.Client(VERSION, USERNAME, PASSWORD,
+        ...                      PROJECT_ID, AUTH_URL)
+
+    Here ``VERSION`` can be a string or
+    ``novaclient.api_versions.APIVersion`` obj. If you prefer string value,
+    you can use ``1.1`` (deprecated now), ``2`` or ``2.X``
+    (where X is a microversion).
+
+
+    Alternatively, you can create a client instance using the keystoneauth
+    session API. See "The novaclient Python API" page at
+    python-novaclient's doc.
+    """
+    if args:
+        warnings.warn("Only VERSION, USERNAME, PASSWORD, PROJECT_ID and "
+                      "AUTH_URL arguments can be specified as positional "
+                      "arguments. All other variables should be keyword "
+                      "arguments. Note that this will become an error in "
+                      "Ocata.")
+    api_version, client_class = _get_client_class_and_version(version)
+    kwargs.pop("direct_use", None)
+    return client_class(username=username, api_key=api_key,
+                        project_id=project_id, auth_url=auth_url,
+                        api_version=api_version, direct_use=False,
+                        *args, **kwargs)

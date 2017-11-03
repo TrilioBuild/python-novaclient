@@ -13,26 +13,30 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from novaclient import api_versions
 from novaclient.tests.unit import utils
 from novaclient.tests.unit.v2 import fakes
 from novaclient.v2 import flavor_access
 
 
-cs = fakes.FakeClient()
-
-
 class FlavorAccessTest(utils.TestCase):
+    def setUp(self):
+        super(FlavorAccessTest, self).setUp()
+        self.cs = fakes.FakeClient(api_versions.APIVersion("2.0"))
 
     def test_list_access_by_flavor_private(self):
-        kwargs = {'flavor': cs.flavors.get(2)}
-        r = cs.flavor_access.list(**kwargs)
-        cs.assert_called('GET', '/flavors/2/os-flavor-access')
-        [self.assertIsInstance(a, flavor_access.FlavorAccess) for a in r]
+        kwargs = {'flavor': self.cs.flavors.get(2)}
+        r = self.cs.flavor_access.list(**kwargs)
+        self.assert_request_id(r, fakes.FAKE_REQUEST_ID_LIST)
+        self.cs.assert_called('GET', '/flavors/2/os-flavor-access')
+        for a in r:
+            self.assertIsInstance(a, flavor_access.FlavorAccess)
 
     def test_add_tenant_access(self):
-        flavor = cs.flavors.get(2)
+        flavor = self.cs.flavors.get(2)
         tenant = 'proj2'
-        r = cs.flavor_access.add_tenant_access(flavor, tenant)
+        r = self.cs.flavor_access.add_tenant_access(flavor, tenant)
+        self.assert_request_id(r, fakes.FAKE_REQUEST_ID_LIST)
 
         body = {
             "addTenantAccess": {
@@ -40,13 +44,15 @@ class FlavorAccessTest(utils.TestCase):
             }
         }
 
-        cs.assert_called('POST', '/flavors/2/action', body)
-        [self.assertIsInstance(a, flavor_access.FlavorAccess) for a in r]
+        self.cs.assert_called('POST', '/flavors/2/action', body)
+        for a in r:
+            self.assertIsInstance(a, flavor_access.FlavorAccess)
 
     def test_remove_tenant_access(self):
-        flavor = cs.flavors.get(2)
+        flavor = self.cs.flavors.get(2)
         tenant = 'proj2'
-        r = cs.flavor_access.remove_tenant_access(flavor, tenant)
+        r = self.cs.flavor_access.remove_tenant_access(flavor, tenant)
+        self.assert_request_id(r, fakes.FAKE_REQUEST_ID_LIST)
 
         body = {
             "removeTenantAccess": {
@@ -54,13 +60,14 @@ class FlavorAccessTest(utils.TestCase):
             }
         }
 
-        cs.assert_called('POST', '/flavors/2/action', body)
-        [self.assertIsInstance(a, flavor_access.FlavorAccess) for a in r]
+        self.cs.assert_called('POST', '/flavors/2/action', body)
+        for a in r:
+            self.assertIsInstance(a, flavor_access.FlavorAccess)
 
     def test_repr_flavor_access(self):
-        flavor = cs.flavors.get(2)
+        flavor = self.cs.flavors.get(2)
         tenant = 'proj3'
-        r = cs.flavor_access.add_tenant_access(flavor, tenant)
+        r = self.cs.flavor_access.add_tenant_access(flavor, tenant)
 
         def get_expected(flavor_access):
             return ("<FlavorAccess flavor id: %s, tenant id: %s>" %

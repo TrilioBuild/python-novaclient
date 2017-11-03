@@ -10,7 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 
 from novaclient.tests.unit import fakes
 from novaclient.tests.unit.fixture_data import base
@@ -159,6 +159,16 @@ class Base(base.Fixture):
                                    json=get_servers_detail,
                                    headers=self.json_headers)
 
+        self.requests.register_uri(
+            'GET', self.url('detail', marker=self.server_1234["id"]),
+            json={"servers": [self.server_1234, self.server_5678]},
+            headers=self.json_headers, complete_qs=True)
+
+        self.requests.register_uri(
+            'GET', self.url('detail', marker=self.server_5678["id"]),
+            json={"servers": []},
+            headers=self.json_headers, complete_qs=True)
+
         self.server_1235 = self.server_1234.copy()
         self.server_1235['id'] = 1235
         self.server_1235['status'] = 'error'
@@ -170,12 +180,14 @@ class Base(base.Fixture):
                                        headers=self.json_headers)
 
         for s in (1234, 5678):
-            self.requests.register_uri('DELETE', self.url(s), status_code=202)
+            self.requests.register_uri('DELETE', self.url(s), status_code=202,
+                                       headers=self.json_headers)
 
         for k in ('test_key', 'key1', 'key2'):
             self.requests.register_uri('DELETE',
                                        self.url(1234, 'metadata', k),
-                                       status_code=204)
+                                       status_code=204,
+                                       headers=self.json_headers)
 
         metadata1 = {'metadata': {'test_key': 'test_value'}}
         self.requests.register_uri('POST', self.url(1234, 'metadata'),
@@ -208,10 +220,15 @@ class Base(base.Fixture):
 
         self.requests.register_uri('GET',
                                    self.url('1234', 'os-security-groups'),
-                                   json=get_security_groups)
+                                   json=get_security_groups,
+                                   headers=self.json_headers)
 
         self.requests.register_uri('POST', self.url(),
                                    json=self.post_servers,
+                                   headers=self.json_headers)
+
+        self.requests.register_uri('POST', self.url('1234', 'remote-consoles'),
+                                   json=self.post_servers_1234_remote_consoles,
                                    headers=self.json_headers)
 
         self.requests.register_uri('POST', self.url('1234', 'action'),
@@ -297,7 +314,52 @@ class Base(base.Fixture):
 
         self.requests.register_uri('DELETE',
                                    self.url(1234, 'os-server-password'),
-                                   status_code=202)
+                                   status_code=202,
+                                   headers=self.json_headers)
+        #
+        # Server tags
+        #
+
+        self.requests.register_uri('GET',
+                                   self.url(1234, 'tags'),
+                                   json={'tags': ['tag1', 'tag2']},
+                                   headers=self.json_headers)
+
+        self.requests.register_uri('GET',
+                                   self.url(1234, 'tags', 'tag'),
+                                   status_code=204,
+                                   headers=self.json_headers)
+
+        self.requests.register_uri('DELETE',
+                                   self.url(1234, 'tags', 'tag'),
+                                   status_code=204,
+                                   headers=self.json_headers)
+
+        self.requests.register_uri('DELETE',
+                                   self.url(1234, 'tags'),
+                                   status_code=204,
+                                   headers=self.json_headers)
+
+        def put_server_tag(request, context):
+            body = jsonutils.loads(request.body)
+            assert body is None
+            context.status_code = 201
+            return None
+
+        self.requests.register_uri('PUT',
+                                   self.url(1234, 'tags', 'tag'),
+                                   json=put_server_tag,
+                                   headers=self.json_headers)
+
+        def put_server_tags(request, context):
+            body = jsonutils.loads(request.body)
+            assert list(body) == ['tags']
+            return body
+
+        self.requests.register_uri('PUT',
+                                   self.url(1234, 'tags'),
+                                   json=put_server_tags,
+                                   headers=self.json_headers)
 
 
 class V1(Base):
@@ -328,10 +390,12 @@ class V1(Base):
 
         self.requests.register_uri('GET',
                                    self.url('1234', 'diagnostics'),
-                                   json=self.diagnostic)
+                                   json=self.diagnostic,
+                                   headers=self.json_headers)
 
         self.requests.register_uri('DELETE',
-                                   self.url('1234', 'os-interface', 'port-id'))
+                                   self.url('1234', 'os-interface', 'port-id'),
+                                   headers=self.json_headers)
 
         # Testing with the following password and key
         #
@@ -357,7 +421,8 @@ class V1(Base):
             'Hi/fmZZNQQqj1Ijq0caOIw=='}
         self.requests.register_uri('GET',
                                    self.url(1234, 'os-server-password'),
-                                   json=get_server_password)
+                                   json=get_server_password,
+                                   headers=self.json_headers)
 
     def post_servers(self, request, context):
         body = jsonutils.loads(request.body)
@@ -377,6 +442,20 @@ class V1(Base):
 
         return {'server': body}
 
+    def post_servers_1234_remote_consoles(self, request, context):
+        _body = ''
+        body = jsonutils.loads(request.body)
+        context.status_code = 202
+        assert len(body.keys()) == 1
+        assert 'remote_console' in body.keys()
+        assert 'protocol' in body['remote_console'].keys()
+        protocol = body['remote_console']['protocol']
+
+        _body = {'protocol': protocol, 'type': 'novnc',
+                 'url': 'http://example.com:6080/vnc_auto.html?token=XYZ'}
+
+        return {'remote_console': _body}
+
     def post_servers_1234_action(self, request, context):
         _body = ''
         body = jsonutils.loads(request.body)
@@ -389,6 +468,11 @@ class V1(Base):
             # is needed to avoid AssertionError in the last 'else' statement
             # if we found 'action' in method check_server_actions and
             # raise AssertionError if we didn't find 'action' at all.
+            pass
+        elif action == 'os-migrateLive':
+            # Fixme(eliqiao): body of os-migrateLive changes from v2.25
+            # but we can not specify version in data_fixture now and this is
+            # V1 data, so just let it pass
             pass
         elif action == 'rebuild':
             body = body[action]
@@ -421,7 +505,7 @@ class V1(Base):
             keys = list(body[action])
             if 'adminPass' in keys:
                 keys.remove('adminPass')
-            assert set(keys) == set(['host', 'onSharedStorage'])
+            assert 'host' in keys
         else:
             raise AssertionError("Unexpected server action: %s" % action)
         return {'server': _body}

@@ -14,10 +14,13 @@
 import sys
 
 import mock
+from oslo_utils import encodeutils
 import six
+from six.moves.urllib import parse
 
 from novaclient import base
 from novaclient import exceptions
+from novaclient.tests.unit import fakes
 from novaclient.tests.unit import utils as test_utils
 from novaclient import utils
 
@@ -27,12 +30,17 @@ UUID = '8e8ec658-c7b0-4243-bdf8-6f7f2952c0d0'
 class FakeResource(object):
     NAME_ATTR = 'name'
 
+    request_ids = fakes.FAKE_REQUEST_ID_LIST
+
     def __init__(self, _id, properties):
         self.id = _id
         try:
             self.name = properties['name']
         except KeyError:
             pass
+
+    def append_request_ids(self, resp):
+        pass
 
 
 class FakeManager(base.ManagerWithFind):
@@ -62,7 +70,7 @@ class FakeManager(base.ManagerWithFind):
         raise exceptions.NotFound(resource_id)
 
     def list(self):
-        return self.resources
+        return base.ListWithMeta(self.resources, fakes.FAKE_REQUEST_ID_LIST)
 
 
 class FakeDisplayResource(object):
@@ -74,6 +82,9 @@ class FakeDisplayResource(object):
             self.display_name = properties['display_name']
         except KeyError:
             pass
+
+    def append_request_ids(self, resp):
+        pass
 
 
 class FakeDisplayManager(FakeManager):
@@ -148,6 +159,15 @@ class FindResourceTestCase(test_utils.TestCase):
         output = utils.find_resource(alphanum_manager, '01234')
         self.assertEqual(output, alphanum_manager.get('01234'))
 
+    def test_find_without_wrapping_exception(self):
+        alphanum_manager = FakeManager(True)
+        self.assertRaises(exceptions.NotFound, utils.find_resource,
+                          alphanum_manager, 'not_exist', wrap_exception=False)
+        res = alphanum_manager.resources[0]
+        alphanum_manager.resources.append(res)
+        self.assertRaises(exceptions.NoUniqueMatch, utils.find_resource,
+                          alphanum_manager, res.name, wrap_exception=False)
+
 
 class _FakeResult(object):
     def __init__(self, name, value):
@@ -215,6 +235,21 @@ class PrintResultTestCase(test_utils.TestCase):
                          '+------+-------+\n',
                          sys.stdout.getvalue())
 
+    @mock.patch('sys.stdout', six.StringIO())
+    def test_print_unicode_list(self):
+        objs = [_FakeResult("k", u'\u2026')]
+        utils.print_list(objs, ["Name", "Value"])
+        if six.PY3:
+            s = u'\u2026'
+        else:
+            s = encodeutils.safe_encode(u'\u2026')
+        self.assertEqual('+------+-------+\n'
+                         '| Name | Value |\n'
+                         '+------+-------+\n'
+                         '| k    | %s     |\n'
+                         '+------+-------+\n' % s,
+                         sys.stdout.getvalue())
+
     # without sorting
     @mock.patch('sys.stdout', six.StringIO())
     def test_print_list_sort_by_none(self):
@@ -266,6 +301,35 @@ class PrintResultTestCase(test_utils.TestCase):
                          '+----------+----------------+\n',
                          sys.stdout.getvalue())
 
+    @mock.patch('sys.stdout', six.StringIO())
+    def test_print_large_dict_list(self):
+        dict = {'k': ['foo1', 'bar1', 'foo2', 'bar2',
+                      'foo3', 'bar3', 'foo4', 'bar4']}
+        utils.print_dict(dict, wrap=40)
+        self.assertEqual(
+            '+----------+------------------------------------------+\n'
+            '| Property | Value                                    |\n'
+            '+----------+------------------------------------------+\n'
+            '| k        | ["foo1", "bar1", "foo2", "bar2", "foo3", |\n'
+            '|          | "bar3", "foo4", "bar4"]                  |\n'
+            '+----------+------------------------------------------+\n',
+            sys.stdout.getvalue())
+
+    @mock.patch('sys.stdout', six.StringIO())
+    def test_print_unicode_dict(self):
+        dict = {'k': u'\u2026'}
+        utils.print_dict(dict)
+        if six.PY3:
+            s = u'\u2026'
+        else:
+            s = encodeutils.safe_encode(u'\u2026')
+        self.assertEqual('+----------+-------+\n'
+                         '| Property | Value |\n'
+                         '+----------+-------+\n'
+                         '| k        | %s     |\n'
+                         '+----------+-------+\n' % s,
+                         sys.stdout.getvalue())
+
 
 class FlattenTestCase(test_utils.TestCase):
     def test_flattening(self):
@@ -276,7 +340,8 @@ class FlattenTestCase(test_utils.TestCase):
                     'b4': {'c1': ['l', 'l', ['l']],
                            'c2': 'string'}},
              'a2': ['l'],
-             'a3': ('t',)})
+             'a3': ('t',),
+             'a4': {}})
 
         self.assertEqual({'a1_b1': 1234,
                           'a1_b2': 'string',
@@ -284,7 +349,8 @@ class FlattenTestCase(test_utils.TestCase):
                           'a1_b4_c1': ['l', 'l', ['l']],
                           'a1_b4_c2': 'string',
                           'a2': ['l'],
-                          'a3': ('t',)},
+                          'a3': ('t',),
+                          'a4': {}},
                          squashed)
 
     def test_pretty_choice_dict(self):
@@ -355,3 +421,41 @@ class DoActionOnManyTestCase(test_utils.TestCase):
 
     def test_do_action_on_many_last_fails(self):
         self._test_do_action_on_many([None, Exception()], fail=True)
+
+
+class RecordTimeTestCase(test_utils.TestCase):
+
+    def test_record_time(self):
+        times = []
+
+        with utils.record_time(times, True, 'a', 'b'):
+            pass
+        self.assertEqual(1, len(times))
+        self.assertEqual(3, len(times[0]))
+        self.assertEqual('a b', times[0][0])
+        self.assertIsInstance(times[0][1], float)
+        self.assertIsInstance(times[0][2], float)
+
+        times = []
+        with utils.record_time(times, False, 'x'):
+            pass
+        self.assertEqual(0, len(times))
+
+
+class PrepareQueryStringTestCase(test_utils.TestCase):
+    def test_convert_dict_to_string(self):
+        ustr = b'?\xd0\xbf=1&\xd1\x80=2'
+        if six.PY3:
+            # in py3 real unicode symbols will be urlencoded
+            ustr = ustr.decode('utf8')
+        cases = (
+            ({}, ''),
+            ({'2': 2, '10': 1}, '?10=1&2=2'),
+            ({'abc': 1, 'abc1': 2}, '?abc=1&abc1=2'),
+            ({b'\xd0\xbf': 1, b'\xd1\x80': 2}, ustr),
+            ({(1, 2): '1', (3, 4): '2'}, '?(1, 2)=1&(3, 4)=2')
+        )
+        for case in cases:
+            self.assertEqual(
+                case[1],
+                parse.unquote_plus(utils.prepare_query_string(case[0])))

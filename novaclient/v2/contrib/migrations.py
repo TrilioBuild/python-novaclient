@@ -16,9 +16,9 @@ migration interface
 
 from six.moves.urllib import parse
 
+from novaclient import api_versions
 from novaclient import base
 from novaclient.i18n import _
-from novaclient.openstack.common import cliutils
 from novaclient import utils
 
 
@@ -54,28 +54,28 @@ class MigrationManager(base.ManagerWithFind):
         return self._list("/os-migrations%s" % query_string, "migrations")
 
 
-@cliutils.arg(
+@utils.arg(
     '--host',
     dest='host',
     metavar='<host>',
     help=_('Fetch migrations for the given host.'))
-@cliutils.arg(
+@utils.arg(
     '--status',
     dest='status',
     metavar='<status>',
     help=_('Fetch migrations for the given status.'))
-@cliutils.arg(
+@utils.arg(
     '--cell_name',
     dest='cell_name',
     metavar='<cell_name>',
     help=_('Fetch migrations for the given cell_name.'))
 def do_migration_list(cs, args):
     """Print a list of migrations."""
-    _print_migrations(cs.migrations.list(args.host, args.status,
-                                         args.cell_name))
+    migrations = cs.migrations.list(args.host, args.status, args.cell_name)
+    _print_migrations(cs, migrations)
 
 
-def _print_migrations(migrations):
+def _print_migrations(cs, migrations):
     fields = ['Source Node', 'Dest Node', 'Source Compute', 'Dest Compute',
               'Dest Host', 'Status', 'Instance UUID', 'Old Flavor',
               'New Flavor', 'Created At', 'Updated At']
@@ -86,6 +86,14 @@ def _print_migrations(migrations):
     def new_flavor(migration):
         return migration.new_instance_type_id
 
+    def migration_type(migration):
+        return migration.migration_type
+
     formatters = {'Old Flavor': old_flavor, 'New Flavor': new_flavor}
+
+    if cs.api_version >= api_versions.APIVersion("2.23"):
+        fields.insert(0, "Id")
+        fields.append("Type")
+        formatters.update({"Type": migration_type})
 
     utils.print_list(migrations, fields, formatters)

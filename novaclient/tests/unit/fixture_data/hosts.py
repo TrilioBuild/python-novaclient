@@ -10,7 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 from six.moves.urllib import parse
 
 from novaclient.tests.unit.fixture_data import base
@@ -36,7 +36,7 @@ class BaseFixture(base.Fixture):
             ]
         }
 
-        headers = {'Content-Type': 'application/json'}
+        headers = self.json_headers
 
         self.requests.register_uri('GET', self.url('host'),
                                    json=get_os_hosts_host,
@@ -62,12 +62,12 @@ class BaseFixture(base.Fixture):
             return {
                 'hosts': [
                     {
-                        'host': 'host1',
+                        'host_name': 'host1',
                         'service': service or 'nova-compute',
                         'zone': zone
                     },
                     {
-                        'host': 'host1',
+                        'host_name': 'host1',
                         'service': service or 'nova-cert',
                         'zone': zone
                     }

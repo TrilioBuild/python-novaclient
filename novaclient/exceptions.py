@@ -24,6 +24,24 @@ class UnsupportedVersion(Exception):
     pass
 
 
+class UnsupportedAttribute(AttributeError):
+    """Indicates that the user is trying to transmit the argument to a method,
+    which is not supported by selected version.
+    """
+
+    def __init__(self, argument_name, start_version, end_version=None):
+        if end_version:
+            self.message = (
+                "'%(name)s' argument is only allowed for microversions "
+                "%(start)s - %(end)s." % {"name": argument_name,
+                                          "start": start_version,
+                                          "end": end_version})
+        else:
+            self.message = (
+                "'%(name)s' argument is only allowed since microversion "
+                "%(start)s." % {"name": argument_name, "start": start_version})
+
+
 class CommandError(Exception):
     pass
 
@@ -77,8 +95,30 @@ class ConnectionRefused(Exception):
         return "ConnectionRefused: %s" % repr(self.response)
 
 
-class InstanceInErrorState(Exception):
-    """Instance is in the error state."""
+class ResourceInErrorState(Exception):
+    """Resource is in the error state."""
+
+    def __init__(self, obj):
+        msg = "`%s` resource is in the error state" % obj.__class__.__name__
+        fault_msg = getattr(obj, "fault", {}).get("message")
+        if fault_msg:
+            msg += "due to '%s'" % fault_msg
+        self.message = "%s." % msg
+
+
+class VersionNotFoundForAPIMethod(Exception):
+    msg_fmt = "API version '%(vers)s' is not supported on '%(method)s' method."
+
+    def __init__(self, version, method):
+        self.version = version
+        self.method = method
+
+    def __str__(self):
+        return self.msg_fmt % {"vers": self.version, "method": self.method}
+
+
+class InstanceInDeletedState(Exception):
+    """Instance is in the deleted state."""
     pass
 
 
@@ -159,6 +199,14 @@ class MethodNotAllowed(ClientException):
     message = "Method Not Allowed"
 
 
+class NotAcceptable(ClientException):
+    """
+    HTTP 406 - Not Acceptable
+    """
+    http_status = 406
+    message = "Not Acceptable"
+
+
 class Conflict(ClientException):
     """
     HTTP 409 - Conflict
@@ -199,15 +247,15 @@ class HTTPNotImplemented(ClientException):
 #
 # Instead, we have to hardcode it:
 _error_classes = [BadRequest, Unauthorized, Forbidden, NotFound,
-                  MethodNotAllowed, Conflict, OverLimit, RateLimit,
-                  HTTPNotImplemented]
+                  MethodNotAllowed, NotAcceptable, Conflict, OverLimit,
+                  RateLimit, HTTPNotImplemented]
 _code_map = dict((c.http_status, c) for c in _error_classes)
 
 
 class InvalidUsage(RuntimeError):
     """This function call is invalid in the way you are using this client.
 
-    Due to the transition to using keystoneclient some function calls are no
+    Due to the transition to using keystoneauth some function calls are no
     longer available. You should make a similar call to the session object
     instead.
     """
@@ -217,7 +265,7 @@ class InvalidUsage(RuntimeError):
 def from_response(response, body, url, method=None):
     """
     Return an instance of an ClientException or subclass
-    based on an requests response.
+    based on a requests response.
 
     Usage::
 
@@ -246,9 +294,21 @@ def from_response(response, body, url, method=None):
         details = "n/a"
 
         if hasattr(body, 'keys'):
-            error = body[list(body)[0]]
-            message = error.get('message')
-            details = error.get('details')
+            # NOTE(mriedem): WebOb<1.6.0 will return a nested dict structure
+            # where the error keys to the message/details/code. WebOb>=1.6.0
+            # returns just a response body as a single dict, not nested,
+            # so we have to handle both cases (since we can't trust what we're
+            # given with content_type: application/json either way.
+            if 'message' in body:
+                # WebOb 1.6.0 case
+                message = body.get('message')
+                details = body.get('details')
+            else:
+                # WebOb<1.6.0 where we assume there is a single error message
+                # key to the body that has the message and details.
+                error = body[list(body)[0]]
+                message = error.get('message')
+                details = error.get('details')
 
         kwargs['message'] = message
         kwargs['details'] = details

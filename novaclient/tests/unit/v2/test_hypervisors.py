@@ -13,9 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from novaclient import api_versions
 from novaclient.tests.unit.fixture_data import client
 from novaclient.tests.unit.fixture_data import hypervisors as data
 from novaclient.tests.unit import utils
+from novaclient.tests.unit.v2 import fakes
 
 
 class HypervisorsTest(utils.FixturedTestCase):
@@ -33,6 +35,7 @@ class HypervisorsTest(utils.FixturedTestCase):
             dict(id=5678, hypervisor_hostname='hyper2')]
 
         result = self.cs.hypervisors.list(False)
+        self.assert_request_id(result, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('GET', '/os-hypervisors')
 
         for idx, hyper in enumerate(result):
@@ -76,6 +79,7 @@ class HypervisorsTest(utils.FixturedTestCase):
                  disk_available_least=100)]
 
         result = self.cs.hypervisors.list()
+        self.assert_request_id(result, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('GET', '/os-hypervisors/detail')
 
         for idx, hyper in enumerate(result):
@@ -87,6 +91,7 @@ class HypervisorsTest(utils.FixturedTestCase):
             dict(id=5678, hypervisor_hostname='hyper2')]
 
         result = self.cs.hypervisors.search('hyper')
+        self.assert_request_id(result, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('GET', '/os-hypervisors/hyper/search')
 
         for idx, hyper in enumerate(result):
@@ -107,6 +112,7 @@ class HypervisorsTest(utils.FixturedTestCase):
         ]
 
         result = self.cs.hypervisors.search('hyper', True)
+        self.assert_request_id(result, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('GET', '/os-hypervisors/hyper/servers')
 
         for idx, hyper in enumerate(result):
@@ -133,6 +139,7 @@ class HypervisorsTest(utils.FixturedTestCase):
             disk_available_least=100)
 
         result = self.cs.hypervisors.get(1234)
+        self.assert_request_id(result, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('GET', '/os-hypervisors/1234')
 
         self.compare_to_expected(expected, result)
@@ -144,6 +151,7 @@ class HypervisorsTest(utils.FixturedTestCase):
             uptime="fake uptime")
 
         result = self.cs.hypervisors.uptime(1234)
+        self.assert_request_id(result, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('GET', '/os-hypervisors/1234/uptime')
 
         self.compare_to_expected(expected, result)
@@ -165,14 +173,29 @@ class HypervisorsTest(utils.FixturedTestCase):
         )
 
         result = self.cs.hypervisors.statistics()
+        self.assert_request_id(result, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('GET', '/os-hypervisors/statistics')
 
         self.compare_to_expected(expected, result)
 
     def test_hypervisor_statistics_data_model(self):
         result = self.cs.hypervisor_stats.statistics()
+        self.assert_request_id(result, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('GET', '/os-hypervisors/statistics')
 
         # Test for Bug #1370415, the line below used to raise AttributeError
         self.assertEqual("<HypervisorStats: 2 Hypervisors>",
                          result.__repr__())
+
+
+class HypervisorsV233Test(HypervisorsTest):
+    def setUp(self):
+        super(HypervisorsV233Test, self).setUp()
+        self.cs.api_version = api_versions.APIVersion("2.33")
+
+    def test_use_limit_marker_params(self):
+        params = {'limit': 10, 'marker': 'fake-marker'}
+        self.cs.hypervisors.list(**params)
+        for k, v in params.items():
+            self.assertIn('%s=%s' % (k, v),
+                          self.requests.last_request.path_url)

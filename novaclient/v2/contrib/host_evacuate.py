@@ -13,9 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from novaclient import api_versions
 from novaclient import base
 from novaclient.i18n import _
-from novaclient.openstack.common import cliutils
 from novaclient import utils
 
 
@@ -27,8 +27,20 @@ def _server_evacuate(cs, server, args):
     success = True
     error_message = ""
     try:
-        cs.servers.evacuate(server=server['uuid'], host=args.target_host,
-                            on_shared_storage=args.on_shared_storage)
+        if api_versions.APIVersion("2.29") <= cs.api_version:
+            # if microversion >= 2.29
+            force = getattr(args, 'force', None)
+            cs.servers.evacuate(server=server['uuid'], host=args.target_host,
+                                force=force)
+        elif api_versions.APIVersion("2.14") <= cs.api_version:
+            # if microversion 2.14 - 2.28
+            cs.servers.evacuate(server=server['uuid'], host=args.target_host)
+        else:
+            # else microversion 2.0 - 2.13
+            on_shared_storage = getattr(args, 'on_shared_storage', None)
+            cs.servers.evacuate(server=server['uuid'],
+                                host=args.target_host,
+                                on_shared_storage=on_shared_storage)
     except Exception as e:
         success = False
         error_message = _("Error while evacuating instance: %s") % e
@@ -38,19 +50,28 @@ def _server_evacuate(cs, server, args):
                                  "error_message": error_message})
 
 
-@cliutils.arg('host', metavar='<host>', help='Name of host.')
-@cliutils.arg(
+@utils.arg('host', metavar='<host>', help='Name of host.')
+@utils.arg(
     '--target_host',
     metavar='<target_host>',
     default=None,
     help=_('Name of target host. If no host is specified the scheduler will '
            'select a target.'))
-@cliutils.arg(
+@utils.arg(
     '--on-shared-storage',
     dest='on_shared_storage',
     action="store_true",
     default=False,
-    help=_('Specifies whether all instances files are on shared storage'))
+    help=_('Specifies whether all instances files are on shared storage'),
+    start_version='2.0',
+    end_version='2.13')
+@utils.arg(
+    '--force',
+    dest='force',
+    action='store_true',
+    default=False,
+    help=_('Force to not verify the scheduler if a host is provided.'),
+    start_version='2.29')
 def do_host_evacuate(cs, args):
     """Evacuate all instances from failed host."""
     hypervisors = cs.hypervisors.search(args.host, servers=True)
