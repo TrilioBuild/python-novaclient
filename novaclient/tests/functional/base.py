@@ -10,10 +10,51 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import ConfigParser
 import os
 import time
 import uuid
 
+import fixtures
+import tempest_lib.cli.base
+import testtools
+
+import novaclient.client
+
+
+# The following are simple filter functions that filter our available
+# image / flavor list so that they can be used in standard testing.
+def pick_flavor(flavors):
+    """Given a flavor list pick a reasonable one."""
+    for flavor in flavors:
+        if flavor.name == 'm1.tiny':
+            return flavor
+    for flavor in flavors:
+        if flavor.name == 'm1.small':
+            return flavor
+    raise NoFlavorException()
+
+
+def pick_image(images):
+    for image in images:
+        if image.name.startswith('cirros') and image.name.endswith('-uec'):
+            return image
+    raise NoImageException()
+
+
+class NoImageException(Exception):
+    """We couldn't find an acceptable image."""
+    pass
+
+
+class NoFlavorException(Exception):
+    """We couldn't find an acceptable flavor."""
+    pass
+
+
+class ClientTestBase(testtools.TestCase):
+    """
+    """
 from cinderclient.v2 import client as cinderclient
 import fixtures
 from glanceclient import client as glanceclient
@@ -155,6 +196,13 @@ class ClientTestBase(testtools.TestCase):
 
         # Collecting of credentials:
         #
+        # Support the existence of a functional_creds.conf for
+        # testing. This makes it possible to use a config file.
+        #
+        # Those variables can be overridden by environmental variables
+        # as well to support existing users running these the old
+        # way. We should deprecate that.
+
         # Grab the cloud config from a user's clouds.yaml file.
         # First look for a functional_admin cloud, as this is a cloud
         # that the user may have defined for functional testing that has
@@ -171,6 +219,33 @@ class ClientTestBase(testtools.TestCase):
         # tempest-lib, we do it in a way that's not available for top
         # level tests. Long term this probably needs to be in the base
         # class.
+        user = os.environ.get('OS_USERNAME')
+        passwd = os.environ.get('OS_PASSWORD')
+        tenant = os.environ.get('OS_TENANT_NAME')
+        auth_url = os.environ.get('OS_AUTH_URL')
+
+        config = ConfigParser.RawConfigParser()
+        if config.read('functional_creds.conf'):
+            # the OR pattern means the environment is preferred for
+            # override
+            user = user or config.get('admin', 'user')
+            passwd = passwd or config.get('admin', 'pass')
+            tenant = tenant or config.get('admin', 'tenant')
+            auth_url = auth_url or config.get('auth', 'uri')
+
+        # TODO(sdague): we made a lot of fun of the glanceclient team
+        # for version as int in first parameter. I guess we know where
+        # they copied it from.
+        self.client = novaclient.client.Client(
+            2, user, passwd, tenant,
+            auth_url=auth_url)
+
+        # pick some reasonable flavor / image combo
+        self.flavor = pick_flavor(self.client.flavors.list())
+        self.image = pick_image(self.client.images.list())
+
+        # create a CLI client in case we'd like to do CLI
+        # testing. tempest_lib does this realy weird thing where it
         openstack_config = os_client_config.config.OpenStackConfig()
         try:
             cloud_config = openstack_config.get_one_cloud('functional_admin')
@@ -245,11 +320,17 @@ class ClientTestBase(testtools.TestCase):
             'OS_NOVACLIENT_EXEC_DIR',
             os.path.join(os.path.abspath('.'), '.tox/functional/bin'))
 
+        self.cli_clients = tempest_lib.cli.base.CLIClient(
         self.cli_clients = tempest.lib.cli.base.CLIClient(
             username=user,
             password=passwd,
             tenant_name=tenant,
             uri=auth_url,
+            cli_dir=cli_dir)
+
+    def nova(self, *args, **kwargs):
+        return self.cli_clients.nova(*args,
+                                     **kwargs)
             cli_dir=cli_dir,
             insecure=self.insecure)
 

@@ -513,6 +513,10 @@ class BootingManagerWithFind(ManagerWithFind):
             if len(mapping_parts) > 3:
                 bdm_dict['delete_on_termination'] = mapping_parts[3]
 
+            # These are the changed made for TrilioVault
+            bdm_dict.pop('source_type')
+            bdm_dict.pop('uuid')
+            bdm_dict.pop('boot_index')
             bdm.append(bdm_dict)
         return bdm
 

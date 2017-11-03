@@ -150,6 +150,7 @@ class HTTPClient(object):
     USER_AGENT = 'python-novaclient'
 
     def __init__(self, user, password, projectid=None, auth_url=None,
+                 domain_name='default',
                  insecure=False, timeout=None, proxy_tenant_id=None,
                  proxy_token=None, region_name=None,
                  endpoint_type='publicURL', service_type=None,
@@ -186,6 +187,8 @@ class HTTPClient(object):
                 raise exceptions.EndpointNotFound()
         self.auth_url = auth_url.rstrip('/') if auth_url else auth_url
         self.version = 'v1.1'
+        self.auth_version = 2
+        self.domain_name = domain_name
         self.region_name = region_name
         self.endpoint_type = endpoint_type
         self.service_type = service_type
@@ -510,7 +513,34 @@ class HTTPClient(object):
         """
 
         # content must always present
-        if resp.status_code == 200 or resp.status_code == 201:
+        if self.auth_version == 3:
+           if resp.status_code == 200 or resp.status_code == 201:
+              try:
+                  self.auth_url = url
+                  self.service_catalog = \
+                      service_catalog.ServiceCatalog(body)
+                  if extract_token:
+                     self.auth_token = resp.headers['x-subject-token']
+
+                  management_url = self.service_catalog.url_for_v3(
+                                   attr='region',
+                                   filter_value=self.region_name,
+                                   endpoint_type=self.endpoint_type,
+                                   service_type=self.service_type,
+                                   service_name=self.service_name)
+                  self.management_url = management_url.rstrip('/')
+                  return None
+              except exceptions.AmbiguousEndpoints:
+                     print("Found more than one valid endpoint. Use a more "
+                      "restrictive filter")
+                     raise
+              except KeyError:
+                     raise exceptions.AuthorizationFailure()
+              except exceptions.EndpointNotFound:
+                     print("Could not find any suitable endpoint. Correct region?")
+                     raise
+
+        elif resp.status_code == 200 or resp.status_code == 201:
             try:
                 self.auth_url = url
                 self.service_catalog = \
@@ -614,9 +644,13 @@ class HTTPClient(object):
             # v2.0 keystone endpoint. Also, new location does not contain
             # real endpoint, only hostname and port.
             except exceptions.AuthorizationFailure:
-                if auth_url.find('v2.0') < 0:
+                if auth_url.find('v3') != -1:
+                   self._v3_auth(auth_url)
+                elif auth_url.find('v2.0') < 0:
                     auth_url = auth_url + '/v2.0'
-                self._v2_auth(auth_url)
+                    self._v2_auth(auth_url)
+                else:
+                     self._v2_auth(auth_url)
 
         if self.bypass_url:
             self.set_management_url(self.bypass_url)
@@ -683,10 +717,33 @@ class HTTPClient(object):
 
         return self._authenticate(url, body)
 
-    def _authenticate(self, url, body, **kwargs):
+    def _v3_auth(self, url):
+        """Authenticate against a v3 auth service."""
+        self.auth_version = 3
+        body = {"auth": {
+                "identity": {
+                         "methods": ["password"],
+                "password": {"user": {"name": self.user,
+                             "domain": { "id": self.domain_name },
+                             "password": self.password}}
+                },
+                "scope": {"project": {"domain":{"id": self.domain_name}}}}}
+        if self.projectid:
+            body['auth']['scope']['project']['name'] = self.projectid
+            #body['auth']['scope']['project']['domain']['id'] = 'default'
+        elif self.tenant_id:
+            body['auth']['scope']['project']['id'] = self.tenant_id
+            #body['auth']['scope']['project']['domain']['id'] = 'default'
+
+        self._authenticate(url, body, v3=True)
+
+    def _authenticate(self, url, body, v3=False, **kwargs):
         """Authenticate and extract the service catalog."""
         method = "POST"
-        token_url = url + "/tokens"
+        if v3 == True:
+           token_url = url + "/auth/tokens"
+        else:
+             token_url = url + "/tokens"
 
         # Make sure we follow redirects when trying to reach Keystone
         resp, respbody = self._time_request(
@@ -702,6 +759,7 @@ class HTTPClient(object):
 def _construct_http_client(username=None, password=None, project_id=None,
                            auth_url=None, insecure=False, timeout=None,
                            proxy_tenant_id=None, proxy_token=None,
+                           domain_name='default',
                            region_name=None, endpoint_type='publicURL',
                            extensions=None, service_type='compute',
                            service_name=None, volume_service_name=None,
@@ -736,6 +794,7 @@ def _construct_http_client(username=None, password=None, project_id=None,
                           tenant_id=tenant_id,
                           auth_url=auth_url,
                           auth_token=auth_token,
+                          domain_name=domain_name,
                           insecure=insecure,
                           timeout=timeout,
                           auth_system=auth_system,

@@ -326,6 +326,7 @@ class ShellTest(utils.TestCase):
                 'name': 'some-server',
                 'block_device_mapping_v2': [
                     {
+                        'uuid': 1,
                         'uuid': FAKE_UUID_1,
                         'source_type': 'image',
                         'destination_type': 'local',
