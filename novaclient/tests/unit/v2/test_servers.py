@@ -20,7 +20,6 @@ import mock
 import six
 
 from novaclient import api_versions
-from novaclient import base
 from novaclient import exceptions
 from novaclient.tests.unit.fixture_data import client
 from novaclient.tests.unit.fixture_data import floatingips
@@ -30,33 +29,18 @@ from novaclient.tests.unit.v2 import fakes
 from novaclient.v2 import servers
 
 
-class _FloatingIPManager(base.Manager):
-    resource_class = base.Resource
-
-    @api_versions.deprecated_after('2.35')
-    def list(self):
-        """DEPRECATED: List floating IPs"""
-        return self._list("/os-floating-ips", "floating_ips")
-
-    @api_versions.deprecated_after('2.35')
-    def get(self, floating_ip):
-        """DEPRECATED: Retrieve a floating IP"""
-        return self._get("/os-floating-ips/%s" % base.getid(floating_ip),
-                         "floating_ip")
-
-
 class ServersTest(utils.FixturedTestCase):
 
     client_fixture_class = client.V1
     data_fixture_class = data.V1
     api_version = None
+    supports_files = True
 
     def setUp(self):
         super(ServersTest, self).setUp()
         self.useFixture(floatingips.FloatingFixture(self.requests_mock))
         if self.api_version:
             self.cs.api_version = api_versions.APIVersion(self.api_version)
-        self.floating_ips = _FloatingIPManager(self.cs)
 
     def _get_server_create_default_nics(self):
         """Callback for default nics kwarg when creating a server.
@@ -143,6 +127,12 @@ class ServersTest(utils.FixturedTestCase):
         self.assertEqual(s1._info, s2._info)
 
     def test_create_server(self):
+        kwargs = {}
+        if self.supports_files:
+            kwargs['files'] = {
+                '/etc/passwd': 'some data',             # a file
+                '/tmp/foo.txt': six.StringIO('data'),   # a stream
+            }
         s = self.cs.servers.create(
             name="My server",
             image=1,
@@ -150,11 +140,8 @@ class ServersTest(utils.FixturedTestCase):
             meta={'foo': 'bar'},
             userdata="hello moto",
             key_name="fakekey",
-            files={
-                '/etc/passwd': 'some data',                 # a file
-                '/tmp/foo.txt': six.StringIO('data'),   # a stream
-            },
-            nics=self._get_server_create_default_nics()
+            nics=self._get_server_create_default_nics(),
+            **kwargs
         )
         self.assert_request_id(s, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('POST', '/servers')
@@ -188,7 +175,7 @@ class ServersTest(utils.FixturedTestCase):
                 nics=nics
             )
             self.assert_request_id(s, fakes.FAKE_REQUEST_ID_LIST)
-            self.assert_called('POST', '/os-volumes_boot')
+            self.assert_called('POST', '/servers')
             self.assertIsInstance(s, servers.Server)
 
         test_create_server_from_volume()
@@ -217,7 +204,7 @@ class ServersTest(utils.FixturedTestCase):
                 nics=self._get_server_create_default_nics()
             )
             self.assert_request_id(s, fakes.FAKE_REQUEST_ID_LIST)
-            self.assert_called('POST', '/os-volumes_boot')
+            self.assert_called('POST', '/servers')
             self.assertIsInstance(s, servers.Server)
 
     def test_create_server_boot_with_nics_ipv6(self):
@@ -270,23 +257,32 @@ class ServersTest(utils.FixturedTestCase):
             self.assertIsInstance(s, servers.Server)
 
     def test_create_server_userdata_file_object(self):
+        kwargs = {}
+        if self.supports_files:
+            kwargs['files'] = {
+                '/etc/passwd': 'some data',             # a file
+                '/tmp/foo.txt': six.StringIO('data'),   # a stream
+            }
         s = self.cs.servers.create(
             name="My server",
             image=1,
             flavor=1,
             meta={'foo': 'bar'},
             userdata=six.StringIO('hello moto'),
-            files={
-                '/etc/passwd': 'some data',                 # a file
-                '/tmp/foo.txt': six.StringIO('data'),   # a stream
-            },
             nics=self._get_server_create_default_nics(),
+            **kwargs
         )
         self.assert_request_id(s, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('POST', '/servers')
         self.assertIsInstance(s, servers.Server)
 
     def test_create_server_userdata_unicode(self):
+        kwargs = {}
+        if self.supports_files:
+            kwargs['files'] = {
+                '/etc/passwd': 'some data',             # a file
+                '/tmp/foo.txt': six.StringIO('data'),   # a stream
+            }
         s = self.cs.servers.create(
             name="My server",
             image=1,
@@ -294,17 +290,20 @@ class ServersTest(utils.FixturedTestCase):
             meta={'foo': 'bar'},
             userdata=six.u('こんにちは'),
             key_name="fakekey",
-            files={
-                '/etc/passwd': 'some data',                 # a file
-                '/tmp/foo.txt': six.StringIO('data'),   # a stream
-            },
             nics=self._get_server_create_default_nics(),
+            **kwargs
         )
         self.assert_request_id(s, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('POST', '/servers')
         self.assertIsInstance(s, servers.Server)
 
     def test_create_server_userdata_utf8(self):
+        kwargs = {}
+        if self.supports_files:
+            kwargs['files'] = {
+                '/etc/passwd': 'some data',             # a file
+                '/tmp/foo.txt': six.StringIO('data'),   # a stream
+            }
         s = self.cs.servers.create(
             name="My server",
             image=1,
@@ -312,11 +311,8 @@ class ServersTest(utils.FixturedTestCase):
             meta={'foo': 'bar'},
             userdata='こんにちは',
             key_name="fakekey",
-            files={
-                '/etc/passwd': 'some data',                 # a file
-                '/tmp/foo.txt': six.StringIO('data'),   # a stream
-            },
             nics=self._get_server_create_default_nics(),
+            **kwargs
         )
         self.assert_request_id(s, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('POST', '/servers')
@@ -340,6 +336,12 @@ class ServersTest(utils.FixturedTestCase):
         self.assertEqual(test_password, body['server']['adminPass'])
 
     def test_create_server_userdata_bin(self):
+        kwargs = {}
+        if self.supports_files:
+            kwargs['files'] = {
+                '/etc/passwd': 'some data',             # a file
+                '/tmp/foo.txt': six.StringIO('data'),   # a stream
+            }
         with tempfile.TemporaryFile(mode='wb+') as bin_file:
             original_data = os.urandom(1024)
             bin_file.write(original_data)
@@ -352,11 +354,8 @@ class ServersTest(utils.FixturedTestCase):
                 meta={'foo': 'bar'},
                 userdata=bin_file,
                 key_name="fakekey",
-                files={
-                    '/etc/passwd': 'some data',                 # a file
-                    '/tmp/foo.txt': six.StringIO('data'),   # a stream
-                },
                 nics=self._get_server_create_default_nics(),
+                **kwargs
             )
             self.assert_request_id(s, fakes.FAKE_REQUEST_ID_LIST)
             self.assert_called('POST', '/servers')
@@ -564,81 +563,6 @@ class ServersTest(utils.FixturedTestCase):
         self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('POST', '/servers/1234/action')
         ret = self.cs.servers.migrate(s)
-        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-
-    @mock.patch('warnings.warn')
-    def test_add_fixed_ip(self, mock_warn):
-        s = self.cs.servers.get(1234)
-        fip = s.add_fixed_ip(1)
-        mock_warn.assert_called_once()
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        fip = self.cs.servers.add_fixed_ip(s, 1)
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-
-    @mock.patch('warnings.warn')
-    def test_remove_fixed_ip(self, mock_warn):
-        s = self.cs.servers.get(1234)
-        ret = s.remove_fixed_ip('10.0.0.1')
-        mock_warn.assert_called_once()
-        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        ret = self.cs.servers.remove_fixed_ip(s, '10.0.0.1')
-        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-
-    @mock.patch('warnings.warn')
-    def test_add_floating_ip(self, mock_warn):
-        s = self.cs.servers.get(1234)
-        fip = s.add_floating_ip('11.0.0.1')
-        mock_warn.assert_called_once()
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        fip = self.cs.servers.add_floating_ip(s, '11.0.0.1')
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        f = self.floating_ips.list()[0]
-        fip = self.cs.servers.add_floating_ip(s, f)
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        fip = s.add_floating_ip(f)
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-
-    def test_add_floating_ip_to_fixed(self):
-        s = self.cs.servers.get(1234)
-        fip = s.add_floating_ip('11.0.0.1', fixed_address='12.0.0.1')
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        fip = self.cs.servers.add_floating_ip(s, '11.0.0.1',
-                                              fixed_address='12.0.0.1')
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        f = self.floating_ips.list()[0]
-        fip = self.cs.servers.add_floating_ip(s, f)
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        fip = s.add_floating_ip(f)
-        self.assert_request_id(fip, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-
-    @mock.patch('warnings.warn')
-    def test_remove_floating_ip(self, mock_warn):
-        s = self.cs.servers.get(1234)
-        ret = s.remove_floating_ip('11.0.0.1')
-        mock_warn.assert_called_once()
-        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        ret = self.cs.servers.remove_floating_ip(s, '11.0.0.1')
-        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        f = self.floating_ips.list()[0]
-        ret = self.cs.servers.remove_floating_ip(s, f)
-        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/servers/1234/action')
-        ret = s.remove_floating_ip(f)
         self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('POST', '/servers/1234/action')
 
@@ -1384,7 +1308,7 @@ class ServersV232Test(ServersV226Test):
                                    key_name="fakekey",
                                    block_device_mapping_v2=bdm)
         self.assert_request_id(s, fakes.FAKE_REQUEST_ID_LIST)
-        self.assert_called('POST', '/os-volumes_boot')
+        self.assert_called('POST', '/servers')
 
     def test_create_server_boot_from_volume_tagged_bdm_v2_pre232(self):
         self.cs.api_version = api_versions.APIVersion("2.31")
@@ -1420,18 +1344,6 @@ class ServersV2_37Test(ServersV226Test):
         self.assert_request_id(s, fakes.FAKE_REQUEST_ID_LIST)
         self.assert_called('POST', '/servers')
         self.assertIsInstance(s, servers.Server)
-
-    def test_add_floating_ip(self):
-        # self.floating_ips.list() is not available after 2.35
-        pass
-
-    def test_add_floating_ip_to_fixed(self):
-        # self.floating_ips.list() is not available after 2.35
-        pass
-
-    def test_remove_floating_ip(self):
-        # self.floating_ips.list() is not available after 2.35
-        pass
 
 
 class ServersCreateImageBackupV2_45Test(utils.FixturedTestCase):
@@ -1550,3 +1462,150 @@ class ServersV252Test(ServersV249Test):
                           key_name="fakekey",
                           nics=self._get_server_create_default_nics(),
                           tags=['tag1', 'tag2'])
+
+
+class ServersV254Test(ServersV252Test):
+
+    api_version = "2.54"
+
+    def test_rebuild_with_key_name(self):
+        s = self.cs.servers.get(1234)
+        ret = s.rebuild(image="1", key_name="test_keypair")
+        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
+        self.assert_called('POST', '/servers/1234/action',
+                           {'rebuild': {
+                               'imageRef': '1',
+                               'key_name': 'test_keypair'}})
+
+    def test_rebuild_with_key_name_none(self):
+        s = self.cs.servers.get(1234)
+        ret = s.rebuild(image="1", key_name=None)
+        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
+        self.assert_called('POST', '/servers/1234/action',
+                           {'rebuild': {
+                               'key_name': None,
+                               'imageRef': '1'}})
+
+    def test_rebuild_with_key_name_pre_254_fails(self):
+        self.cs.api_version = api_versions.APIVersion('2.53')
+        ex = self.assertRaises(exceptions.UnsupportedAttribute,
+                               self.cs.servers.rebuild,
+                               '1234', fakes.FAKE_IMAGE_UUID_1,
+                               key_name='test_keypair')
+        self.assertIn('key_name', six.text_type(ex.message))
+
+
+class ServersV256Test(ServersV254Test):
+
+    api_version = "2.56"
+
+    def test_migrate_server(self):
+        s = self.cs.servers.get(1234)
+        ret = s.migrate()
+        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
+        self.assert_called('POST', '/servers/1234/action',
+                           {'migrate': {}})
+        ret = s.migrate(host='target-host')
+        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
+        self.assert_called('POST', '/servers/1234/action',
+                           {'migrate': {'host': 'target-host'}})
+
+    def test_migrate_server_pre_256_fails(self):
+        self.cs.api_version = api_versions.APIVersion('2.55')
+        s = self.cs.servers.get(1234)
+        ex = self.assertRaises(TypeError,
+                               s.migrate, host='target-host')
+        self.assertIn('host', six.text_type(ex))
+
+
+class ServersV257Test(ServersV256Test):
+    """Tests the servers python API bindings with microversion 2.57 where
+    personality files are deprecated.
+    """
+    api_version = "2.57"
+    supports_files = False
+
+    def test_create_server_with_files_fails(self):
+        ex = self.assertRaises(
+            exceptions.UnsupportedAttribute, self.cs.servers.create,
+            name="My server", image=1, flavor=1,
+            files={
+                '/etc/passwd': 'some data',  # a file
+                '/tmp/foo.txt': six.StringIO('data'),  # a stream
+            }, nics='auto')
+        self.assertIn('files', six.text_type(ex))
+
+    def test_rebuild_server_name_meta_files(self):
+        files = {'/etc/passwd': 'some data'}
+        s = self.cs.servers.get(1234)
+        ex = self.assertRaises(
+            exceptions.UnsupportedAttribute, s.rebuild, image=1, name='new',
+            meta={'foo': 'bar'}, files=files)
+        self.assertIn('files', six.text_type(ex))
+
+
+class ServersV263Test(ServersV257Test):
+
+    api_version = "2.63"
+
+    def test_create_server_with_trusted_image_certificates(self):
+        self.cs.servers.create(
+            name="My server",
+            image=1,
+            flavor=1,
+            meta={'foo': 'bar'},
+            userdata="hello moto",
+            key_name="fakekey",
+            nics=self._get_server_create_default_nics(),
+            trusted_image_certificates=['id1', 'id2'],
+        )
+        self.assert_called('POST', '/servers',
+                           {'server': {
+                               'flavorRef': '1',
+                               'imageRef': '1',
+                               'key_name': 'fakekey',
+                               'max_count': 1,
+                               'metadata': {'foo': 'bar'},
+                               'min_count': 1,
+                               'name': 'My server',
+                               'networks': 'auto',
+                               'trusted_image_certificates': ['id1', 'id2'],
+                               'user_data': 'aGVsbG8gbW90bw=='
+                           }}
+                           )
+
+    def test_create_server_with_trusted_image_certificates_pre_263_fails(self):
+        self.cs.api_version = api_versions.APIVersion('2.62')
+        ex = self.assertRaises(
+            exceptions.UnsupportedAttribute, self.cs.servers.create,
+            name="My server", image=1, flavor=1, meta={'foo': 'bar'},
+            userdata="hello moto", key_name="fakekey",
+            nics=self._get_server_create_default_nics(),
+            trusted_image_certificates=['id1', 'id2'])
+        self.assertIn('trusted_image_certificates', six.text_type(ex))
+
+    def test_rebuild_server_with_trusted_image_certificates(self):
+        s = self.cs.servers.get(1234)
+        ret = s.rebuild(image="1", trusted_image_certificates=['id1', 'id2'])
+        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
+        self.assert_called('POST', '/servers/1234/action',
+                           {'rebuild': {
+                               'imageRef': '1',
+                               'trusted_image_certificates': ['id1', 'id2']}})
+
+    def test_rebuild_server_with_trusted_image_certificates_none(self):
+        s = self.cs.servers.get(1234)
+        ret = s.rebuild(image="1", trusted_image_certificates=None)
+        self.assert_request_id(ret, fakes.FAKE_REQUEST_ID_LIST)
+        self.assert_called('POST', '/servers/1234/action',
+                           {'rebuild': {
+                               'imageRef': '1',
+                               'trusted_image_certificates': None}})
+
+    def test_rebuild_with_trusted_image_certificates_pre_263_fails(self):
+        self.cs.api_version = api_versions.APIVersion('2.62')
+        ex = self.assertRaises(exceptions.UnsupportedAttribute,
+                               self.cs.servers.rebuild,
+                               '1234', fakes.FAKE_IMAGE_UUID_1,
+                               trusted_image_certificates=['id1', 'id2'])
+        self.assertIn('trusted_image_certificates', six.text_type(ex))

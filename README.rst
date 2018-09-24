@@ -12,12 +12,8 @@ Python bindings to the OpenStack Compute API
 ============================================
 
 .. image:: https://img.shields.io/pypi/v/python-novaclient.svg
-    :target: https://pypi.python.org/pypi/python-novaclient/
+    :target: https://pypi.org/project/python-novaclient/
     :alt: Latest Version
-
-.. image:: https://img.shields.io/pypi/dm/python-novaclient.svg
-    :target: https://pypi.python.org/pypi/python-novaclient/
-    :alt: Downloads
 
 This is a client for the OpenStack Compute API. It provides a Python API (the
 ``novaclient`` module) and a command-line script (``nova``). Each implements
@@ -32,8 +28,9 @@ This is a client for the OpenStack Compute API. It provides a Python API (the
 * `Source`_
 * `Specs`_
 * `How to Contribute`_
+* `Release Notes`_
 
-.. _PyPi: https://pypi.python.org/pypi/python-novaclient
+.. _PyPi: https://pypi.org/project/python-novaclient
 .. _Online Documentation: https://docs.openstack.org/python-novaclient/latest
 .. _Launchpad project: https://launchpad.net/python-novaclient
 .. _Blueprints: https://blueprints.launchpad.net/python-novaclient
@@ -41,3 +38,4 @@ This is a client for the OpenStack Compute API. It provides a Python API (the
 .. _Source: https://git.openstack.org/cgit/openstack/python-novaclient
 .. _How to Contribute: https://docs.openstack.org/infra/manual/developers.html
 .. _Specs: http://specs.openstack.org/openstack/nova-specs/
+.. _Release Notes: https://docs.openstack.org/releasenotes/python-novaclient

@@ -22,19 +22,21 @@ from keystoneauth1 import session as ksession
 from keystoneclient import client as keystoneclient
 from keystoneclient import discover as keystone_discover
 from neutronclient.v2_0 import client as neutronclient
-import os_client_config
+import openstack.config
+import openstack.config.exceptions
 from oslo_utils import uuidutils
 import tempest.lib.cli.base
 import testtools
 
 import novaclient
 import novaclient.api_versions
+from novaclient import base
 import novaclient.client
 from novaclient.v2 import networks
 import novaclient.v2.shell
 
 BOOT_IS_COMPLETE = ("login as 'cirros' user. default password: "
-                    "'cubswin:)'. use 'sudo' for root.")
+                    "'gocubsgo'. use 'sudo' for root.")
 
 
 def is_keystone_version_available(session, version):
@@ -172,18 +174,18 @@ class ClientTestBase(testtools.TestCase):
         # tempest-lib, we do it in a way that's not available for top
         # level tests. Long term this probably needs to be in the base
         # class.
-        openstack_config = os_client_config.config.OpenStackConfig()
+        openstack_config = openstack.config.OpenStackConfig()
         try:
             cloud_config = openstack_config.get_one_cloud('functional_admin')
-        except os_client_config.exceptions.OpenStackConfigException:
+        except openstack.config.exceptions.OpenStackConfigException:
             try:
                 cloud_config = openstack_config.get_one_cloud(
                     'devstack', auth=dict(
                         username='admin', project_name='admin'))
-            except os_client_config.exceptions.OpenStackConfigException:
+            except openstack.config.exceptions.OpenStackConfigException:
                 try:
                     cloud_config = openstack_config.get_one_cloud('envvars')
-                except os_client_config.exceptions.OpenStackConfigException:
+                except openstack.config.exceptions.OpenStackConfigException:
                     cloud_config = None
 
         if cloud_config is None:
@@ -371,15 +373,22 @@ class ClientTestBase(testtools.TestCase):
                     raise
             time.sleep(poll_interval)
         else:
-            self.fail("The resource '%s' still exists." % resource.id)
+            self.fail("The resource '%s' still exists." % base.getid(resource))
 
-    def name_generate(self, prefix='Entity'):
-        """Generate randomized name for some entity.
-
-        :param prefix: string prefix
-        """
-        name = "%s-%s" % (prefix, uuidutils.generate_uuid())
-        return name
+    def name_generate(self):
+        """Generate randomized name for some entity."""
+        # NOTE(andreykurilin): name_generator method is used for various
+        #   resources (servers, flavors, volumes, keystone users, etc).
+        #   Since the length of name has limits we cannot use the whole UUID,
+        #   so the first 8 chars is taken from it.
+        #   Based on the fact that the new name includes class and method
+        #   names, 8 chars of uuid should be enough to prevent any conflicts,
+        #   even if the single test will be launched in parallel thousand times
+        return "%(prefix)s-%(test_cls)s-%(test_name)s" % {
+            "prefix": uuidutils.generate_uuid()[:8],
+            "test_cls": self.__class__.__name__,
+            "test_name": self.id().rsplit(".", 1)[-1]
+        }
 
     def _get_value_from_the_table(self, table, key):
         """Parses table to get desired value.
@@ -468,14 +477,15 @@ class ClientTestBase(testtools.TestCase):
                     values.append(line.split("|")[1].strip())
         return values
 
-    def _create_server(self, name=None, with_network=True, add_cleanup=True,
-                       **kwargs):
-        name = name or self.name_generate(prefix='server')
+    def _create_server(self, name=None, flavor=None, with_network=True,
+                       add_cleanup=True, **kwargs):
+        name = name or self.name_generate()
         if with_network:
             nics = [{"net-id": self.network.id}]
         else:
             nics = None
-        server = self.client.servers.create(name, self.image, self.flavor,
+        flavor = flavor or self.flavor
+        server = self.client.servers.create(name, self.image, flavor,
                                             nics=nics, **kwargs)
         if add_cleanup:
             self.addCleanup(server.delete)
@@ -520,8 +530,8 @@ class TenantTestBase(ClientTestBase):
 
     def setUp(self):
         super(TenantTestBase, self).setUp()
-        user_name = self.name_generate('v' + self.COMPUTE_API_VERSION)
-        project_name = self.name_generate('v' + self.COMPUTE_API_VERSION)
+        user_name = uuidutils.generate_uuid()
+        project_name = uuidutils.generate_uuid()
         password = 'password'
 
         if self.keystone.version == "v3":

@@ -293,15 +293,6 @@ class Base(base.Fixture):
 
             return {'server': self.server_9012}
 
-        # NOTE(jamielennox): hack to make os_volumes mock go to the right place
-        base_url = self.base_url
-        self.base_url = None
-        self.requests_mock.post(self.url('os-volumes_boot'),
-                                json=post_os_volumes_boot,
-                                status_code=202,
-                                headers=self.json_headers)
-        self.base_url = base_url
-
         #
         # Server password
         #
@@ -461,6 +452,8 @@ class V1(Base):
             # but we can not specify version in data_fixture now and this is
             # V1 data, so just let it pass
             pass
+        elif action == 'migrate':
+            return None
         elif action == 'rebuild':
             body = body[action]
             adminPass = body.get('adminPass', 'randompassword')

@@ -16,6 +16,7 @@ import distutils.version as dist_version
 import re
 import sys
 
+import ddt
 import fixtures
 from keystoneauth1 import fixture
 import mock
@@ -35,7 +36,11 @@ FAKE_ENV = {'OS_USERNAME': 'username',
             'OS_PASSWORD': 'password',
             'OS_TENANT_NAME': 'tenant_name',
             'OS_AUTH_URL': 'http://no.where/v2.0',
-            'OS_COMPUTE_API_VERSION': '2'}
+            'OS_COMPUTE_API_VERSION': '2',
+            'OS_PROJECT_DOMAIN_ID': 'default',
+            'OS_PROJECT_DOMAIN_NAME': 'default',
+            'OS_USER_DOMAIN_ID': 'default',
+            'OS_USER_DOMAIN_NAME': 'default'}
 
 FAKE_ENV2 = {'OS_USER_ID': 'user_id',
              'OS_PASSWORD': 'password',
@@ -349,6 +354,7 @@ class ParserTest(utils.TestCase):
         self.assertTrue(args.tic_tac)
 
 
+@ddt.ddt
 class ShellTest(utils.TestCase):
 
     _msg_no_tenant_project = ("You must provide a project name or project"
@@ -467,9 +473,9 @@ class ShellTest(utils.TestCase):
                             matchers.MatchesRegex(r, re.DOTALL | re.MULTILINE))
 
     def test_no_username(self):
-        required = ('You must provide a username or user ID'
-                    ' via --os-username, --os-user-id,'
-                    ' env[OS_USERNAME] or env[OS_USER_ID]')
+        required = ('You must provide a user name/id (via --os-username, '
+                    '--os-user-id, env[OS_USERNAME] or env[OS_USER_ID]) or '
+                    'an auth token (via --os-token).')
         self.make_env(exclude='OS_USERNAME')
         try:
             self.shell('list')
@@ -479,9 +485,9 @@ class ShellTest(utils.TestCase):
             self.fail('CommandError not raised')
 
     def test_no_user_id(self):
-        required = ('You must provide a username or user ID'
-                    ' via --os-username, --os-user-id,'
-                    ' env[OS_USERNAME] or env[OS_USER_ID]')
+        required = ('You must provide a user name/id (via --os-username, '
+                    '--os-user-id, env[OS_USERNAME] or env[OS_USER_ID]) or '
+                    'an auth token (via --os-token).')
         self.make_env(exclude='OS_USER_ID', fake_env=FAKE_ENV2)
         try:
             self.shell('list')
@@ -520,6 +526,23 @@ class ShellTest(utils.TestCase):
             self.assertEqual(required, message.args)
         else:
             self.fail('CommandError not raised')
+
+    @ddt.data(
+        (None, 'project_domain_id', FAKE_ENV['OS_PROJECT_DOMAIN_ID']),
+        ('OS_PROJECT_DOMAIN_ID', 'project_domain_id', ''),
+        (None, 'project_domain_name', FAKE_ENV['OS_PROJECT_DOMAIN_NAME']),
+        ('OS_PROJECT_DOMAIN_NAME', 'project_domain_name', ''),
+        (None, 'user_domain_id', FAKE_ENV['OS_USER_DOMAIN_ID']),
+        ('OS_USER_DOMAIN_ID', 'user_domain_id', ''),
+        (None, 'user_domain_name', FAKE_ENV['OS_USER_DOMAIN_NAME']),
+        ('OS_USER_DOMAIN_NAME', 'user_domain_name', '')
+    )
+    @ddt.unpack
+    def test_basic_attributes(self, exclude, client_arg, env_var):
+        self.make_env(exclude=exclude, fake_env=FAKE_ENV)
+        self.shell('list')
+        client_kwargs = self.mock_client.call_args_list[0][1]
+        self.assertEqual(env_var, client_kwargs[client_arg])
 
     @requests_mock.Mocker()
     def test_nova_endpoint_type(self, m_requests):
@@ -575,20 +598,6 @@ class ShellTest(utils.TestCase):
         self.register_keystone_discovery_fixture(m_requests)
         stdout, stderr = self.shell('list')
         self.assertEqual((stdout + stderr), ex)
-
-    @mock.patch('sys.stdin', side_effect=mock.MagicMock)
-    @mock.patch('getpass.getpass', side_effect=EOFError)
-    def test_no_password(self, mock_getpass, mock_stdin):
-        required = ('Expecting a password provided'
-                    ' via either --os-password, env[OS_PASSWORD],'
-                    ' or prompted response',)
-        self.make_env(exclude='OS_PASSWORD')
-        try:
-            self.shell('list')
-        except exceptions.CommandError as message:
-            self.assertEqual(required, message.args)
-        else:
-            self.fail('CommandError not raised')
 
     def _test_service_type(self, version, service_type, mock_client):
         if version is None:
@@ -665,25 +674,6 @@ class ShellTest(utils.TestCase):
             _, stderr = self.shell('list --profile swordfish', (0, 2))
             self.assertIn('unrecognized arguments: --profile swordfish',
                           stderr)
-
-    @mock.patch('novaclient.shell.SecretsHelper.tenant_id',
-                return_value=True)
-    @mock.patch('novaclient.shell.SecretsHelper.auth_token',
-                return_value=True)
-    @mock.patch('novaclient.shell.SecretsHelper.management_url',
-                return_value=True)
-    @requests_mock.Mocker()
-    def test_keyring_saver_helper(self,
-                                  sh_management_url_function,
-                                  sh_auth_token_function,
-                                  sh_tenant_id_function,
-                                  m_requests):
-        self.make_env(fake_env=FAKE_ENV)
-        self.register_keystone_discovery_fixture(m_requests)
-        self.shell('list')
-        mock_client_instance = self.mock_client.return_value
-        keyring_saver = mock_client_instance.client.keyring_saver
-        self.assertIsInstance(keyring_saver, novaclient.shell.SecretsHelper)
 
     def test_microversion_with_default_behaviour(self):
         self.make_env(fake_env=FAKE_ENV5)

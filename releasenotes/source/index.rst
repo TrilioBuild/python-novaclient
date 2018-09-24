@@ -8,6 +8,8 @@ Contents
    :maxdepth: 2
 
    unreleased
+   rocky
+   queens
    pike
    ocata
    newton

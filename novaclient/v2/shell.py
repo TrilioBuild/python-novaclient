@@ -19,6 +19,7 @@
 from __future__ import print_function
 
 import argparse
+import codecs
 import collections
 import datetime
 import getpass
@@ -48,47 +49,14 @@ from novaclient.v2 import servers
 
 logger = logging.getLogger(__name__)
 
-CERT_DEPRECATION_WARNING = (
-    _('The nova-cert service is deprecated. This command will be removed '
-      'in the first major release after the Nova server 16.0.0 Pike release.')
-)
 
-CLOUDPIPE_DEPRECATION_WARNING = (
-    _('The os-cloudpipe Nova API has been removed.  This command will be '
-      'removed in the first major release after the Nova server 16.0.0 Pike '
-      'release.')
-)
-
-
-# NOTE(mriedem): Remove this along with the deprecated commands in the first
-# major python-novaclient release AFTER the nova server 16.0.0 Pike release.
-def emit_hosts_deprecation_warning(command_name, replacement=None):
-    if replacement is None:
-        print(_('WARNING: Command %s is deprecated and will be removed '
-                'in the first major release after the Nova server 16.0.0 '
-                'Pike release. There is no replacement or alternative for '
-                'this command. Specify --os-compute-api-version less than '
-                '2.43 to continue using this command until it is removed.') %
-              command_name, file=sys.stderr)
-    else:
-        print(_('WARNING: Command %(command)s is deprecated and will be '
-                'removed in the first major release after the Nova server '
-                '16.0.0 Pike release. Use %(replacement)s instead. Specify '
-                '--os-compute-api-version less than 2.43 to continue using '
-                'this command until it is removed.') %
-              {'command': command_name, 'replacement': replacement},
-              file=sys.stderr)
-
-
-# NOTE(mriedem): Remove this along with the deprecated commands in the first
-# major python-novaclient release AFTER the nova server 16.0.0 Pike release.
-def emit_fixed_floating_deprecation_warning(command_name):
-    print(_('WARNING: Command %s is deprecated and will be removed '
-            'in the first major release after the Nova server 16.0.0 '
-            'Pike release. Use python-neutronclient or python-openstackclient'
-            'instead. Specify --os-compute-api-version less than 2.44 '
-            'to continue using this command until it is removed.') %
-          command_name, file=sys.stderr)
+def emit_duplicated_image_with_warning(img, image_with):
+    img_uuid_list = [str(image.id) for image in img]
+    print(_('WARNING: Multiple matching images: %(img_uuid_list)s\n'
+            'Using image: %(chosen_one)s') %
+          {'img_uuid_list': img_uuid_list,
+           'chosen_one': img_uuid_list[0]},
+          file=sys.stderr)
 
 
 CLIENT_BDM2_KEYS = {
@@ -396,10 +364,13 @@ def _boot(cs, args):
 
     if not image and args.image_with:
         images = _match_image(cs, args.image_with)
+        if len(images) > 1:
+            emit_duplicated_image_with_warning(images, args.image_with)
         if images:
-            # TODO(harlowja): log a warning that we
-            # are selecting the first of many?
             image = images[0]
+        else:
+            raise exceptions.CommandError(_("No images match the property "
+                                            "expected by --image-with"))
 
     min_count = 1
     max_count = 1
@@ -421,19 +392,22 @@ def _boot(cs, args):
 
     meta = _meta_parsing(args.meta)
 
-    files = {}
-    for f in args.files:
-        try:
-            dst, src = f.split('=', 1)
-            files[dst] = open(src)
-        except IOError as e:
-            raise exceptions.CommandError(_("Can't open '%(src)s': %(exc)s") %
-                                          {'src': src, 'exc': e})
-        except ValueError:
-            raise exceptions.CommandError(_("Invalid file argument '%s'. "
-                                            "File arguments must be of the "
-                                            "form '--file "
-                                            "<dst-path=src-path>'") % f)
+    include_files = cs.api_version < api_versions.APIVersion('2.57')
+    if include_files:
+        files = {}
+        for f in args.files:
+            try:
+                dst, src = f.split('=', 1)
+                files[dst] = open(src)
+            except IOError as e:
+                raise exceptions.CommandError(
+                    _("Can't open '%(src)s': %(exc)s") %
+                    {'src': src, 'exc': e})
+            except ValueError:
+                raise exceptions.CommandError(
+                    _("Invalid file argument '%s'. "
+                      "File arguments must be of the "
+                      "form '--file <dst-path=src-path>'") % f)
 
     # use the os-keypair extension
     key_name = None
@@ -511,7 +485,6 @@ def _boot(cs, args):
 
     boot_kwargs = dict(
         meta=meta,
-        files=files,
         key_name=key_name,
         min_count=min_count,
         max_count=max_count,
@@ -533,6 +506,22 @@ def _boot(cs, args):
 
     if 'tags' in args and args.tags:
         boot_kwargs["tags"] = args.tags.split(',')
+
+    if include_files:
+        boot_kwargs['files'] = files
+
+    if ('trusted_image_certificates' in args and
+            args.trusted_image_certificates):
+        boot_kwargs['trusted_image_certificates'] = (
+            args.trusted_image_certificates)
+    elif utils.env('OS_TRUSTED_IMAGE_CERTIFICATE_IDS'):
+        if cs.api_version >= api_versions.APIVersion('2.63'):
+            boot_kwargs["trusted_image_certificates"] = utils.env(
+                'OS_TRUSTED_IMAGE_CERTIFICATE_IDS').split(',')
+        else:
+            raise exceptions.UnsupportedAttribute(
+                "OS_TRUSTED_IMAGE_CERTIFICATE_IDS",
+                "2.63")
 
     return boot_args, boot_kwargs
 
@@ -590,7 +579,11 @@ def _boot(cs, args):
     dest='files',
     default=[],
     help=_("Store arbitrary files from <src-path> locally to <dst-path> "
-           "on the new server. Limited by the injected_files quota value."))
+           "on the new server. More files can be injected using multiple "
+           "'--file' options. Limited by the 'injected_files' quota value. "
+           "The default value is 5. You can get the current quota value by "
+           "'Personality' limit from 'nova limits' command."),
+    start_version='2.0', end_version='2.56')
 @utils.arg(
     '--key-name',
     default=os.environ.get('NOVACLIENT_DEFAULT_KEY_NAME'),
@@ -619,7 +612,7 @@ def _boot(cs, args):
     action='append',
     default=[],
     help=_("Block device mapping in the format "
-           "<dev-name>=<id>:<type>:<size(GB)>:<delete-on-terminate>."))
+           "<dev-name>=<id>:<type>:<size(GiB)>:<delete-on-terminate>."))
 @utils.arg(
     '--block-device',
     metavar="key1=value1[,key2=value2...]",
@@ -641,7 +634,7 @@ def _boot(cs, args):
            "depending on selected bus; note the libvirt driver always "
            "uses default device names), "
            "size=size of the block device in MB(for swap) and in "
-           "GB(for other formats) "
+           "GiB(for other formats) "
            "(if omitted, hypervisor driver calculates size), "
            "format=device will be formatted (e.g. swap, ntfs, ...; optional), "
            "bootindex=integer used for ordering the boot disks "
@@ -671,7 +664,7 @@ def _boot(cs, args):
            "depending on selected bus; note the libvirt driver always "
            "uses default device names), "
            "size=size of the block device in MB(for swap) and in "
-           "GB(for other formats) "
+           "GiB(for other formats) "
            "(if omitted, hypervisor driver calculates size), "
            "format=device will be formatted (e.g. swap, ntfs, ...; optional), "
            "bootindex=integer used for ordering the boot disks "
@@ -700,7 +693,7 @@ def _boot(cs, args):
            "depending on selected bus; note the libvirt driver always "
            "uses default device names), "
            "size=size of the block device in MB(for swap) and in "
-           "GB(for other formats) "
+           "GiB(for other formats) "
            "(if omitted, hypervisor driver calculates size), "
            "format=device will be formatted (e.g. swap, ntfs, ...; optional), "
            "bootindex=integer used for ordering the boot disks "
@@ -728,7 +721,7 @@ def _boot(cs, args):
            "depending on selected bus; note the libvirt driver always "
            "uses default device names), "
            "size=size of the block device in MB(for swap) and in "
-           "GB(for other formats) "
+           "GiB(for other formats) "
            "(if omitted, hypervisor driver calculates size), "
            "format=device will be formatted (e.g. swap, ntfs, ...; optional), "
            "bootindex=integer used for ordering the boot disks "
@@ -747,7 +740,7 @@ def _boot(cs, args):
     metavar="size=<size>[,format=<format>]",
     action='append',
     default=[],
-    help=_("Create and attach a local ephemeral block device of <size> GB "
+    help=_("Create and attach a local ephemeral block device of <size> GiB "
            "and format it to <format>."))
 @utils.arg(
     '--hint',
@@ -894,12 +887,21 @@ def _boot(cs, args):
     action="store_true",
     default=False,
     help=_("Return a reservation id bound to created servers."))
+@utils.arg(
+    '--trusted-image-certificate-id',
+    metavar='<trusted-image-certificate-id>',
+    action='append',
+    dest='trusted_image_certificates',
+    default=[],
+    help=_('Trusted image certificate IDs used to validate certificates '
+           'during the image signature verification process. '
+           'Defaults to env[OS_TRUSTED_IMAGE_CERTIFICATE_IDS]. '
+           'May be specified multiple times to pass multiple trusted image '
+           'certificate IDs.'),
+    start_version="2.63")
 def do_boot(cs, args):
     """Boot a new server."""
     boot_args, boot_kwargs = _boot(cs, args)
-
-    extra_boot_kwargs = utils.get_resource_manager_extra_kwargs(do_boot, args)
-    boot_kwargs.update(extra_boot_kwargs)
 
     server = cs.servers.create(*boot_args, **boot_kwargs)
     if boot_kwargs['reservation_id']:
@@ -911,38 +913,6 @@ def do_boot(cs, args):
 
     if args.poll:
         _poll_for_status(cs.servers.get, server.id, 'building', ['active'])
-
-
-def do_cloudpipe_list(cs, _args):
-    """DEPRECATED Print a list of all cloudpipe instances."""
-
-    print(CLOUDPIPE_DEPRECATION_WARNING, file=sys.stderr)
-
-    cloudpipes = cs.cloudpipe.list()
-    columns = ['Project Id', "Public IP", "Public Port", "Internal IP"]
-    utils.print_list(cloudpipes, columns)
-
-
-@utils.arg(
-    'project',
-    metavar='<project_id>',
-    help=_('UUID of the project to create the cloudpipe for.'))
-def do_cloudpipe_create(cs, args):
-    """DEPRECATED Create a cloudpipe instance for the given project."""
-
-    print(CLOUDPIPE_DEPRECATION_WARNING, file=sys.stderr)
-
-    cs.cloudpipe.create(args.project)
-
-
-@utils.arg('address', metavar='<ip address>', help=_('New IP Address.'))
-@utils.arg('port', metavar='<port>', help=_('New Port.'))
-def do_cloudpipe_configure(cs, args):
-    """DEPRECATED Update the VPN IP/port of a cloudpipe instance."""
-
-    print(CLOUDPIPE_DEPRECATION_WARNING, file=sys.stderr)
-
-    cs.cloudpipe.update(args.address, args.port)
 
 
 def _poll_for_status(poll_fn, obj_id, action, final_ok_states,
@@ -1006,6 +976,7 @@ def _expand_dict_attr(collection, attr):
         delattr(item, attr)
         for subkey in field.keys():
             setattr(item, attr + ':' + subkey, field[subkey])
+            item.set_info(attr + ':' + subkey, field[subkey])
 
 
 def _translate_keys(collection, convert):
@@ -1015,6 +986,7 @@ def _translate_keys(collection, convert):
         for from_key, to_key in convert:
             if from_key in keys and to_key not in keys:
                 setattr(item, to_key, item_dict[from_key])
+                item.set_info(to_key, item_dict[from_key])
 
 
 def _translate_extended_states(collection):
@@ -1039,6 +1011,8 @@ def _translate_extended_states(collection):
             getattr(item, 'task_state')
         except AttributeError:
             setattr(item, 'task_state', "N/A")
+        item.set_info('power_state', item.power_state)
+        item.set_info('task_state', item.task_state)
 
 
 def _translate_flavor_keys(collection):
@@ -1052,7 +1026,7 @@ def _print_flavor_extra_specs(flavor):
         return "N/A"
 
 
-def _print_flavor_list(flavors, show_extra_specs=False):
+def _print_flavor_list(cs, flavors, show_extra_specs=False):
     _translate_flavor_keys(flavors)
 
     headers = [
@@ -1067,11 +1041,16 @@ def _print_flavor_list(flavors, show_extra_specs=False):
         'Is_Public',
     ]
 
+    formatters = {}
     if show_extra_specs:
-        formatters = {'extra_specs': _print_flavor_extra_specs}
+        # Starting with microversion 2.61, extra specs are included
+        # in the flavor details response.
+        if cs.api_version < api_versions.APIVersion('2.61'):
+            formatters = {'extra_specs': _print_flavor_extra_specs}
         headers.append('extra_specs')
-    else:
-        formatters = {}
+
+    if cs.api_version >= api_versions.APIVersion('2.55'):
+        headers.append('Description')
 
     utils.print_list(flavors, headers, formatters)
 
@@ -1138,7 +1117,7 @@ def do_flavor_list(cs, args):
         flavors = cs.flavors.list(marker=args.marker, min_disk=args.min_disk,
                                   min_ram=args.min_ram, sort_key=args.sort_key,
                                   sort_dir=args.sort_dir, limit=args.limit)
-    _print_flavor_list(flavors, args.extra_specs)
+    _print_flavor_list(cs, flavors, args.extra_specs)
 
 
 @utils.arg(
@@ -1147,9 +1126,8 @@ def do_flavor_list(cs, args):
     help=_("Name or ID of the flavor to delete."))
 def do_flavor_delete(cs, args):
     """Delete a specific flavor"""
-    flavorid = _find_flavor(cs, args.flavor)
-    cs.flavors.delete(flavorid)
-    _print_flavor_list([flavorid])
+    flavor = _find_flavor(cs, args.flavor)
+    cs.flavors.delete(flavor)
 
 
 @utils.arg(
@@ -1178,11 +1156,11 @@ def do_flavor_show(cs, args):
 @utils.arg(
     'disk',
     metavar='<disk>',
-    help=_("Disk size in GB."))
+    help=_("Disk size in GiB."))
 @utils.arg(
     '--ephemeral',
     metavar='<ephemeral>',
-    help=_("Ephemeral space size in GB (default 0)."),
+    help=_("Ephemeral space size in GiB (default 0)."),
     default=0)
 @utils.arg(
     'vcpus',
@@ -1191,7 +1169,7 @@ def do_flavor_show(cs, args):
 @utils.arg(
     '--swap',
     metavar='<swap>',
-    help=_("Swap space size in MB (default 0)."),
+    help=_("Additional swap space size in MB (default 0)."),
     default=0)
 @utils.arg(
     '--rxtx-factor',
@@ -1204,12 +1182,39 @@ def do_flavor_show(cs, args):
     help=_("Make flavor accessible to the public (default true)."),
     type=lambda v: strutils.bool_from_string(v, True),
     default=True)
+@utils.arg(
+    '--description',
+    metavar='<description>',
+    help=_('A free form description of the flavor. Limited to 65535 '
+           'characters in length. Only printable characters are allowed.'),
+    start_version='2.55')
 def do_flavor_create(cs, args):
     """Create a new flavor."""
+    if cs.api_version >= api_versions.APIVersion('2.55'):
+        description = args.description
+    else:
+        description = None
     f = cs.flavors.create(args.name, args.ram, args.vcpus, args.disk, args.id,
                           args.ephemeral, args.swap, args.rxtx_factor,
-                          args.is_public)
-    _print_flavor_list([f])
+                          args.is_public, description)
+    _print_flavor_list(cs, [f])
+
+
+@api_versions.wraps('2.55')
+@utils.arg(
+    'flavor',
+    metavar='<flavor>',
+    help=_('Name or ID of the flavor to update.'))
+@utils.arg(
+    'description',
+    metavar='<description>',
+    help=_('A free form description of the flavor. Limited to 65535 '
+           'characters in length. Only printable characters are allowed.'))
+def do_flavor_update(cs, args):
+    """Update the description of an existing flavor."""
+    flavorid = _find_flavor(cs, args.flavor)
+    flavor = cs.flavors.update(flavorid, args.description)
+    _print_flavor_list(cs, [flavor])
 
 
 @utils.arg(
@@ -1338,7 +1343,10 @@ def _print_flavor(flavor):
     info = flavor.to_dict()
     # ignore links, we don't need to present those
     info.pop('links')
-    info.update({"extra_specs": _print_flavor_extra_specs(flavor)})
+    # Starting with microversion 2.61, extra specs are included
+    # in the flavor details response.
+    if 'extra_specs' not in info:
+        info.update({"extra_specs": _print_flavor_extra_specs(flavor)})
     utils.print_dict(info)
 
 
@@ -1467,8 +1475,8 @@ def _print_flavor(flavor):
     dest='changes_since',
     metavar='<changes_since>',
     default=None,
-    help=_("List only servers changed after a certain point of time."
-           "The provided time should be an ISO 8061 formatted time."
+    help=_("List only servers changed after a certain point of time. "
+           "The provided time should be an ISO 8061 formatted time. "
            "ex 2016-03-04T06:27:59Z ."))
 @utils.arg(
     '--tags',
@@ -1673,12 +1681,19 @@ def _get_list_table_columns_and_formatters(fields, objs, exclude_fields=(),
 
     columns = []
     formatters = {}
+    existing_fields = set()
 
     non_existent_fields = []
     exclude_fields = set(exclude_fields)
 
+    # NOTE(ttsiouts): Bug #1733917. Validating the fields using the keys of
+    # the Resource.to_dict(). Adding also the 'networks' field.
+    if obj:
+        obj_dict = obj.to_dict()
+        existing_fields = set(['networks']) | set(obj_dict.keys())
+
     for field in fields.split(','):
-        if not hasattr(obj, field):
+        if field not in existing_fields:
             non_existent_fields.append(field)
             continue
         if field in exclude_fields:
@@ -1785,7 +1800,57 @@ def do_reboot(cs, args):
     dest='files',
     default=[],
     help=_("Store arbitrary files from <src-path> locally to <dst-path> "
-           "on the new server. You may store up to 5 files."))
+           "on the new server. More files can be injected using multiple "
+           "'--file' options. You may store up to 5 files by default. "
+           "The maximum number of files is specified by the 'Personality' "
+           "limit reported by the 'nova limits' command."),
+    start_version='2.0', end_version='2.56')
+@utils.arg(
+    '--key-name',
+    metavar='<key-name>',
+    default=None,
+    help=_("Keypair name to set in the server. "
+           "Cannot be specified with the '--key-unset' option."),
+    start_version='2.54')
+@utils.arg(
+    '--key-unset',
+    action='store_true',
+    default=False,
+    help=_("Unset keypair in the server. "
+           "Cannot be specified with the '--key-name' option."),
+    start_version='2.54')
+@utils.arg(
+    '--user-data',
+    default=None,
+    metavar='<user-data>',
+    help=_("User data file to pass to be exposed by the metadata server."),
+    start_version='2.57')
+@utils.arg(
+    '--user-data-unset',
+    action='store_true',
+    default=False,
+    help=_("Unset user_data in the server. Cannot be specified with the "
+           "'--user-data' option."),
+    start_version='2.57')
+@utils.arg(
+    '--trusted-image-certificate-id',
+    metavar='<trusted-image-certificate-id>',
+    action='append',
+    dest='trusted_image_certificates',
+    default=[],
+    help=_('Trusted image certificate IDs used to validate certificates '
+           'during the image signature verification process. '
+           'Defaults to env[OS_TRUSTED_IMAGE_CERTIFICATE_IDS]. '
+           'May be specified multiple times to pass multiple trusted image '
+           'certificate IDs.'),
+    start_version="2.63")
+@utils.arg(
+    '--trusted-image-certificates-unset',
+    action='store_true',
+    default=False,
+    help=_("Unset trusted_image_certificates in the server. Cannot be "
+           "specified with the '--trusted-image-certificate-id' option."),
+    start_version="2.63")
 def do_rebuild(cs, args):
     """Shutdown, re-image, and re-boot a server."""
     server = _find_server(cs, args.server)
@@ -1796,29 +1861,78 @@ def do_rebuild(cs, args):
     else:
         _password = None
 
-    kwargs = utils.get_resource_manager_extra_kwargs(do_rebuild, args)
-    kwargs['preserve_ephemeral'] = args.preserve_ephemeral
-    kwargs['name'] = args.name
+    kwargs = {'preserve_ephemeral': args.preserve_ephemeral,
+              'name': args.name,
+              'meta': _meta_parsing(args.meta)}
     if 'description' in args:
         kwargs['description'] = args.description
-    meta = _meta_parsing(args.meta)
-    kwargs['meta'] = meta
 
-    files = {}
-    for f in args.files:
-        try:
-            dst, src = f.split('=', 1)
-            with open(src, 'r') as s:
-                files[dst] = s.read()
-        except IOError as e:
-            raise exceptions.CommandError(_("Can't open '%(src)s': %(exc)s") %
-                                          {'src': src, 'exc': e})
-        except ValueError:
-            raise exceptions.CommandError(_("Invalid file argument '%s'. "
-                                            "File arguments must be of the "
-                                            "form '--file "
-                                            "<dst-path=src-path>'") % f)
-    kwargs['files'] = files
+    # 2.57 deprecates the --file option and adds the --user-data and
+    # --user-data-unset options.
+    if cs.api_version < api_versions.APIVersion('2.57'):
+        files = {}
+        for f in args.files:
+            try:
+                dst, src = f.split('=', 1)
+                with open(src, 'r') as s:
+                    files[dst] = s.read()
+            except IOError as e:
+                raise exceptions.CommandError(
+                    _("Can't open '%(src)s': %(exc)s") %
+                    {'src': src, 'exc': e})
+            except ValueError:
+                raise exceptions.CommandError(
+                    _("Invalid file argument '%s'. "
+                      "File arguments must be of the "
+                      "form '--file <dst-path=src-path>'") % f)
+        kwargs['files'] = files
+    else:
+        if args.user_data_unset:
+            kwargs['userdata'] = None
+            if args.user_data:
+                raise exceptions.CommandError(
+                    _("Cannot specify '--user-data-unset' with "
+                      "'--user-data'."))
+        elif args.user_data:
+            kwargs['userdata'] = args.user_data
+
+    if cs.api_version >= api_versions.APIVersion('2.54'):
+        if args.key_unset:
+            kwargs['key_name'] = None
+            if args.key_name:
+                raise exceptions.CommandError(
+                    _("Cannot specify '--key-unset' with '--key-name'."))
+        elif args.key_name:
+            kwargs['key_name'] = args.key_name
+
+    if cs.api_version >= api_versions.APIVersion('2.63'):
+        # First determine if the user specified anything via the command line
+        # or the environment variable.
+        trusted_image_certificates = None
+        if ('trusted_image_certificates' in args and
+                args.trusted_image_certificates):
+            trusted_image_certificates = args.trusted_image_certificates
+        elif utils.env('OS_TRUSTED_IMAGE_CERTIFICATE_IDS'):
+            trusted_image_certificates = utils.env(
+                'OS_TRUSTED_IMAGE_CERTIFICATE_IDS').split(',')
+
+        if args.trusted_image_certificates_unset:
+            kwargs['trusted_image_certificates'] = None
+            # Check for conflicts in option usage.
+            if trusted_image_certificates:
+                raise exceptions.CommandError(
+                    _("Cannot specify '--trusted-image-certificates-unset' "
+                      "with '--trusted-image-certificate-id' or with "
+                      "OS_TRUSTED_IMAGE_CERTIFICATE_IDS env variable set."))
+        elif trusted_image_certificates:
+            # Only specify the kwarg if there is a value specified to avoid
+            # confusion with unsetting the value.
+            kwargs['trusted_image_certificates'] = trusted_image_certificates
+    elif utils.env('OS_TRUSTED_IMAGE_CERTIFICATE_IDS'):
+        raise exceptions.UnsupportedAttribute(
+            "OS_TRUSTED_IMAGE_CERTIFICATE_IDS",
+            "2.63")
+
     server = server.rebuild(image, _password, **kwargs)
     _print_server(cs, args, server)
 
@@ -1848,10 +1962,6 @@ def do_update(cs, args):
     update_kwargs = {}
     if args.name:
         update_kwargs["name"] = args.name
-    # NOTE(andreykurilin): `do_update` method is used by `do_rename` method,
-    # which do not have description argument at all. When `do_rename` will be
-    # removed after deprecation period, feel free to change the check below to:
-    #     `if args.description:`
     if "description" in args and args.description is not None:
         update_kwargs["description"] = args.description
     _find_server(cs, args.server).update(**update_kwargs)
@@ -1872,8 +1982,7 @@ def do_resize(cs, args):
     """Resize a server."""
     server = _find_server(cs, args.server)
     flavor = _find_flavor(cs, args.flavor)
-    kwargs = utils.get_resource_manager_extra_kwargs(do_resize, args)
-    server.resize(flavor, **kwargs)
+    server.resize(flavor)
     if args.poll:
         _poll_for_status(cs.servers.get, server.id, 'resizing',
                          ['active', 'verify_resize'])
@@ -1893,15 +2002,25 @@ def do_resize_revert(cs, args):
 
 @utils.arg('server', metavar='<server>', help=_('Name or ID of server.'))
 @utils.arg(
+    '--host',
+    metavar='<host>',
+    default=None,
+    help=_('Destination host name.'),
+    start_version='2.56')
+@utils.arg(
     '--poll',
     dest='poll',
     action="store_true",
     default=False,
     help=_('Report the server migration progress until it completes.'))
 def do_migrate(cs, args):
-    """Migrate a server. The new host will be selected by the scheduler."""
+    """Migrate a server."""
+    update_kwargs = {}
+    if 'host' in args and args.host:
+        update_kwargs['host'] = args.host
+
     server = _find_server(cs, args.server)
-    server.migrate()
+    server.migrate(**update_kwargs)
 
     if args.poll:
         _poll_for_status(cs.servers.get, server.id, 'migrating',
@@ -2312,27 +2431,6 @@ def _find_network_id(cs, net_name):
         raise exceptions.CommandError(six.text_type(e))
 
 
-@utils.arg('server', metavar='<server>', help=_('Name or ID of server.'))
-@utils.arg(
-    'network_id',
-    metavar='<network-id>',
-    help=_('Network ID.'))
-def do_add_fixed_ip(cs, args):
-    """DEPRECATED Add new IP address on a network to server."""
-    emit_fixed_floating_deprecation_warning('add-fixed-ip')
-    server = _find_server(cs, args.server)
-    server.add_fixed_ip(args.network_id)
-
-
-@utils.arg('server', metavar='<server>', help=_('Name or ID of server.'))
-@utils.arg('address', metavar='<address>', help=_('IP Address.'))
-def do_remove_fixed_ip(cs, args):
-    """DEPRECATED Remove an IP address from a server."""
-    emit_fixed_floating_deprecation_warning('remove-fixed-ip')
-    server = _find_server(cs, args.server)
-    server.remove_fixed_ip(args.address)
-
-
 def _print_volume(volume):
     utils.print_dict(volume.to_dict())
 
@@ -2567,38 +2665,10 @@ def do_console_log(cs, args):
     """Get console log output of a server."""
     server = _find_server(cs, args.server)
     data = server.get_console_output(length=args.length)
-    print(data)
 
-
-@utils.arg('server', metavar='<server>', help=_('Name or ID of server.'))
-@utils.arg('address', metavar='<address>', help=_('IP Address.'))
-@utils.arg(
-    '--fixed-address',
-    metavar='<fixed_address>',
-    default=None,
-    help=_('Fixed IP Address to associate with.'))
-def do_floating_ip_associate(cs, args):
-    """DEPRECATED Associate a floating IP address to a server."""
-    emit_fixed_floating_deprecation_warning('floating-ip-associate')
-    _associate_floating_ip(cs, args)
-
-
-def _associate_floating_ip(cs, args):
-    server = _find_server(cs, args.server)
-    server.add_floating_ip(args.address, args.fixed_address)
-
-
-@utils.arg('server', metavar='<server>', help=_('Name or ID of server.'))
-@utils.arg('address', metavar='<address>', help=_('IP Address.'))
-def do_floating_ip_disassociate(cs, args):
-    """DEPRECATED Disassociate a floating IP address from a server."""
-    emit_fixed_floating_deprecation_warning('floating-ip-disassociate')
-    _disassociate_floating_ip(cs, args)
-
-
-def _disassociate_floating_ip(cs, args):
-    server = _find_server(cs, args.server)
-    server.remove_floating_ip(args.address)
+    if data and data[-1] != '\n':
+        data += '\n'
+    codecs.getwriter('utf-8')(sys.stdout).write(data)
 
 
 @utils.arg('server', metavar='<server>', help=_('Name or ID of server.'))
@@ -2857,7 +2927,8 @@ def _print_absolute_limits(limits):
             used[name] = l.value
         else:
             other[name] = l.value
-            columns.append('Other')
+            if 'Other' not in columns:
+                columns.append('Other')
         if name not in limit_names:
             limit_names.append(name)
 
@@ -2944,7 +3015,7 @@ def do_usage_list(cs, args):
     """List usage data for all tenants."""
     dateformat = "%Y-%m-%d"
     rows = ["Tenant ID", "Servers", "RAM MB-Hours", "CPU Hours",
-            "Disk GB-Hours"]
+            "Disk GiB-Hours"]
 
     now = timeutils.utcnow()
 
@@ -3012,7 +3083,7 @@ def do_usage_list(cs, args):
 def do_usage(cs, args):
     """Show usage data for a single tenant."""
     dateformat = "%Y-%m-%d"
-    rows = ["Servers", "RAM MB-Hours", "CPU Hours", "Disk GB-Hours"]
+    rows = ["Servers", "RAM MB-Hours", "CPU Hours", "Disk GiB-Hours"]
 
     now = timeutils.utcnow()
 
@@ -3066,63 +3137,6 @@ def do_usage(cs, args):
         utils.print_list([usage], rows)
     else:
         print(_('None'))
-
-
-@utils.arg(
-    'pk_filename',
-    metavar='<private-key-filename>',
-    nargs='?',
-    default='pk.pem',
-    help=_('Filename for the private key. [Default: pk.pem]'))
-@utils.arg(
-    'cert_filename',
-    metavar='<x509-cert-filename>',
-    nargs='?',
-    default='cert.pem',
-    help=_('Filename for the X.509 certificate. [Default: cert.pem]'))
-def do_x509_create_cert(cs, args):
-    """DEPRECATED Create x509 cert for a user in tenant."""
-    print(CERT_DEPRECATION_WARNING, file=sys.stderr)
-
-    if os.path.exists(args.pk_filename):
-        raise exceptions.CommandError(_("Unable to write privatekey - %s "
-                                        "exists.") % args.pk_filename)
-    if os.path.exists(args.cert_filename):
-        raise exceptions.CommandError(_("Unable to write x509 cert - %s "
-                                        "exists.") % args.cert_filename)
-
-    certs = cs.certs.create()
-
-    try:
-        old_umask = os.umask(0o377)
-        with open(args.pk_filename, 'w') as private_key:
-            private_key.write(certs.private_key)
-            print(_("Wrote private key to %s") % args.pk_filename)
-    finally:
-        os.umask(old_umask)
-
-    with open(args.cert_filename, 'w') as cert:
-        cert.write(certs.data)
-        print(_("Wrote x509 certificate to %s") % args.cert_filename)
-
-
-@utils.arg(
-    'filename',
-    metavar='<filename>',
-    nargs='?',
-    default='cacert.pem',
-    help=_('Filename to write the x509 root cert.'))
-def do_x509_get_root_cert(cs, args):
-    """DEPRECATED Fetch the x509 root cert."""
-    print(CERT_DEPRECATION_WARNING, file=sys.stderr)
-    if os.path.exists(args.filename):
-        raise exceptions.CommandError(_("Unable to write x509 root cert - \
-                                      %s exists.") % args.filename)
-
-    with open(args.filename, 'w') as cert:
-        cacert = cs.certs.get()
-        cert.write(cacert.data)
-        print(_("Wrote x509 root cert to %s") % args.filename)
 
 
 @utils.arg(
@@ -3220,6 +3234,7 @@ def do_aggregate_delete(cs, args):
     help=_('Name or ID of aggregate to update.'))
 @utils.arg(
     '--name',
+    metavar='<name>',
     dest='name',
     help=_('New name for aggregate.'))
 @utils.arg(
@@ -3235,6 +3250,11 @@ def do_aggregate_update(cs, args):
         updates["name"] = args.name
     if args.availability_zone:
         updates["availability_zone"] = args.availability_zone
+
+    if not updates:
+        raise exceptions.CommandError(_(
+            "Either '--name <name>' or '--availability-zone "
+            "<availability-zone>' must be specified."))
 
     aggregate = cs.aggregates.update(aggregate.id, updates)
     print(_("Aggregate %s has been successfully updated.") % aggregate.id)
@@ -3493,13 +3513,9 @@ def do_service_list(cs, args):
 # values.
 @api_versions.wraps('2.0', '2.52')
 @utils.arg('host', metavar='<hostname>', help=_('Name of host.'))
-# TODO(mriedem): Eventually just hard-code the binary to "nova-compute".
-@utils.arg('binary', metavar='<binary>', help=_('Service binary. The only '
-           'meaningful binary is "nova-compute". (Deprecated)'),
-           default='nova-compute', nargs='?')
 def do_service_enable(cs, args):
     """Enable the service."""
-    result = cs.services.enable(args.host, args.binary)
+    result = cs.services.enable(args.host, 'nova-compute')
     utils.print_list([result], ['Host', 'Binary', 'Status'])
 
 
@@ -3516,10 +3532,6 @@ def do_service_enable(cs, args):
 # values.
 @api_versions.wraps('2.0', '2.52')
 @utils.arg('host', metavar='<hostname>', help=_('Name of host.'))
-# TODO(mriedem): Eventually just hard-code the binary to "nova-compute".
-@utils.arg('binary', metavar='<binary>', help=_('Service binary. The only '
-           'meaningful binary is "nova-compute". (Deprecated)'),
-           default='nova-compute', nargs='?')
 @utils.arg(
     '--reason',
     metavar='<reason>',
@@ -3527,12 +3539,12 @@ def do_service_enable(cs, args):
 def do_service_disable(cs, args):
     """Disable the service."""
     if args.reason:
-        result = cs.services.disable_log_reason(args.host, args.binary,
+        result = cs.services.disable_log_reason(args.host, 'nova-compute',
                                                 args.reason)
         utils.print_list([result], ['Host', 'Binary', 'Status',
                          'Disabled Reason'])
     else:
-        result = cs.services.disable(args.host, args.binary)
+        result = cs.services.disable(args.host, 'nova-compute')
         utils.print_list([result], ['Host', 'Binary', 'Status'])
 
 
@@ -3558,10 +3570,6 @@ def do_service_disable(cs, args):
 # values.
 @api_versions.wraps("2.11", "2.52")
 @utils.arg('host', metavar='<hostname>', help=_('Name of host.'))
-# TODO(mriedem): Eventually just hard-code the binary to "nova-compute".
-@utils.arg('binary', metavar='<binary>', help=_('Service binary. The only '
-           'meaningful binary is "nova-compute". (Deprecated)'),
-           default='nova-compute', nargs='?')
 @utils.arg(
     '--unset',
     dest='force_down',
@@ -3570,7 +3578,7 @@ def do_service_disable(cs, args):
     default=True)
 def do_service_force_down(cs, args):
     """Force service to down."""
-    result = cs.services.force_down(args.host, args.binary, args.force_down)
+    result = cs.services.force_down(args.host, 'nova-compute', args.force_down)
     utils.print_list([result], ['Host', 'Binary', 'Forced down'])
 
 
@@ -3606,75 +3614,6 @@ def do_service_delete(cs, args):
 def do_service_delete(cs, args):
     """Delete the service by UUID ID."""
     cs.services.delete(args.id)
-
-
-@utils.arg('host', metavar='<hostname>', help=_('Name of host.'))
-def do_host_describe(cs, args):
-    """DEPRECATED Describe a specific host."""
-    emit_hosts_deprecation_warning('host-describe', 'hypervisor-show')
-
-    result = cs.hosts.get(args.host)
-    columns = ["HOST", "PROJECT", "cpu", "memory_mb", "disk_gb"]
-    utils.print_list(result, columns)
-
-
-@utils.arg(
-    '--zone',
-    metavar='<zone>',
-    default=None,
-    help=_('Filters the list, returning only those hosts in the availability '
-           'zone <zone>.'))
-def do_host_list(cs, args):
-    """DEPRECATED List all hosts by service."""
-    emit_hosts_deprecation_warning('host-list', 'hypervisor-list')
-
-    columns = ["host_name", "service", "zone"]
-    result = cs.hosts.list(args.zone)
-    utils.print_list(result, columns)
-
-
-@utils.arg('host', metavar='<hostname>', help=_('Name of host.'))
-@utils.arg(
-    '--status', metavar='<enable|disable>', default=None, dest='status',
-    help=_('Either enable or disable a host.'))
-@utils.arg(
-    '--maintenance',
-    metavar='<enable|disable>',
-    default=None,
-    dest='maintenance',
-    help=_('Either put or resume host to/from maintenance.'))
-def do_host_update(cs, args):
-    """DEPRECATED Update host settings."""
-    if args.status == 'enable':
-        emit_hosts_deprecation_warning('host-update', 'service-enable')
-    elif args.status == 'disable':
-        emit_hosts_deprecation_warning('host-update', 'service-disable')
-    else:
-        emit_hosts_deprecation_warning('host-update')
-
-    updates = {}
-    columns = ["HOST"]
-    if args.status:
-        updates['status'] = args.status
-        columns.append("status")
-    if args.maintenance:
-        updates['maintenance_mode'] = args.maintenance
-        columns.append("maintenance_mode")
-    result = cs.hosts.update(args.host, updates)
-    utils.print_list([result], columns)
-
-
-@utils.arg('host', metavar='<hostname>', help=_('Name of host.'))
-@utils.arg(
-    '--action', metavar='<action>', dest='action',
-    choices=['startup', 'shutdown', 'reboot'],
-    help=_('A power action: startup, reboot, or shutdown.'))
-def do_host_action(cs, args):
-    """DEPRECATED Perform a power action on a host."""
-    emit_hosts_deprecation_warning('host-action')
-
-    result = cs.hosts.host_action(args.host, args.action)
-    utils.print_list([result], ['HOST', 'power_action'])
 
 
 def _find_hypervisor(cs, hypervisor):
@@ -3913,6 +3852,10 @@ def do_ssh(cs, args):
 # return floating_ips, fixed_ips, security_groups or security_group_members
 # as those are deprecated as networking service proxies and/or because
 # nova-network is deprecated. Similar to the 2.36 microversion.
+# NOTE(mriedem): In the 2.57 microversion, the os-quota-sets and
+# os-quota-class-sets APIs will no longer return injected_files,
+# injected_file_content_bytes or injected_file_content_bytes since personality
+# files (file injection) is deprecated starting with v2.57.
 _quota_resources = ['instances', 'cores', 'ram',
                     'floating_ips', 'fixed_ips', 'metadata_items',
                     'injected_files', 'injected_file_content_bytes',
@@ -4116,6 +4059,7 @@ def do_quota_update(cs, args):
 
 # 2.36 does not support updating quota for floating IPs, fixed IPs, security
 # groups or security group rules.
+# 2.57 does not support updating injected_file* quotas.
 @api_versions.wraps("2.36")
 @utils.arg(
     'tenant',
@@ -4152,19 +4096,22 @@ def do_quota_update(cs, args):
     metavar='<injected-files>',
     type=int,
     default=None,
-    help=_('New value for the "injected-files" quota.'))
+    help=_('New value for the "injected-files" quota.'),
+    start_version='2.36', end_version='2.56')
 @utils.arg(
     '--injected-file-content-bytes',
     metavar='<injected-file-content-bytes>',
     type=int,
     default=None,
-    help=_('New value for the "injected-file-content-bytes" quota.'))
+    help=_('New value for the "injected-file-content-bytes" quota.'),
+    start_version='2.36', end_version='2.56')
 @utils.arg(
     '--injected-file-path-bytes',
     metavar='<injected-file-path-bytes>',
     type=int,
     default=None,
-    help=_('New value for the "injected-file-path-bytes" quota.'))
+    help=_('New value for the "injected-file-path-bytes" quota.'),
+    start_version='2.36', end_version='2.56')
 @utils.arg(
     '--key-pairs',
     metavar='<key-pairs>',
@@ -4321,6 +4268,7 @@ def do_quota_class_update(cs, args):
 
 # 2.50 does not support updating quota class values for floating IPs,
 # fixed IPs, security groups or security group rules.
+# 2.57 does not support updating injected_file* quotas.
 @api_versions.wraps("2.50")
 @utils.arg(
     'class_name',
@@ -4352,19 +4300,22 @@ def do_quota_class_update(cs, args):
     metavar='<injected-files>',
     type=int,
     default=None,
-    help=_('New value for the "injected-files" quota.'))
+    help=_('New value for the "injected-files" quota.'),
+    start_version='2.50', end_version='2.56')
 @utils.arg(
     '--injected-file-content-bytes',
     metavar='<injected-file-content-bytes>',
     type=int,
     default=None,
-    help=_('New value for the "injected-file-content-bytes" quota.'))
+    help=_('New value for the "injected-file-content-bytes" quota.'),
+    start_version='2.50', end_version='2.56')
 @utils.arg(
     '--injected-file-path-bytes',
     metavar='<injected-file-path-bytes>',
     type=int,
     default=None,
-    help=_('New value for the "injected-file-path-bytes" quota.'))
+    help=_('New value for the "injected-file-path-bytes" quota.'),
+    start_version='2.50', end_version='2.56')
 @utils.arg(
     '--key-pairs',
     metavar='<key-pairs>',
@@ -4574,16 +4525,15 @@ def do_availability_zone_list(cs, _args):
                      sortby_index=None)
 
 
-@api_versions.wraps("2.0", "2.12")
 def _print_server_group_details(cs, server_group):
-    columns = ['Id', 'Name', 'Policies', 'Members', 'Metadata']
-    utils.print_list(server_group, columns)
-
-
-@api_versions.wraps("2.13")
-def _print_server_group_details(cs, server_group):    # noqa
-    columns = ['Id', 'Name', 'Project Id', 'User Id',
-               'Policies', 'Members', 'Metadata']
+    if cs.api_version < api_versions.APIVersion('2.13'):
+        columns = ['Id', 'Name', 'Policies', 'Members', 'Metadata']
+    elif cs.api_version < api_versions.APIVersion('2.64'):
+        columns = ['Id', 'Name', 'Project Id', 'User Id',
+                   'Policies', 'Members', 'Metadata']
+    else:
+        columns = ['Id', 'Name', 'Project Id', 'User Id',
+                   'Policy', 'Rules', 'Members']
     utils.print_list(server_group, columns)
 
 
@@ -4618,16 +4568,40 @@ def do_server_group_list(cs, args):
     _print_server_group_details(cs, server_groups)
 
 
+@api_versions.wraps("2.0", "2.63")
 @utils.arg('name', metavar='<name>', help=_('Server group name.'))
 @utils.arg(
     'policy',
     metavar='<policy>',
-    nargs='+',
-    help=_('Policies for the server groups.'))
+    help=_('Policy for the server group.'))
 def do_server_group_create(cs, args):
     """Create a new server group with the specified details."""
     server_group = cs.server_groups.create(name=args.name,
                                            policies=args.policy)
+    _print_server_group_details(cs, [server_group])
+
+
+@api_versions.wraps("2.64")
+@utils.arg('name', metavar='<name>', help=_('Server group name.'))
+@utils.arg(
+    'policy',
+    metavar='<policy>',
+    help=_('Policy for the server group.'))
+@utils.arg(
+    '--rule',
+    metavar="<key=value>",
+    dest='rules',
+    action='append',
+    default=[],
+    help=_('A rule for the policy. Currently, only the '
+           '"max_server_per_host" rule is supported for the '
+           '"anti-affinity" policy.'))
+def do_server_group_create(cs, args):
+    """Create a new server group with the specified details."""
+    rules = _meta_parsing(args.rules)
+    server_group = cs.server_groups.create(name=args.name,
+                                           policy=args.policy,
+                                           rules=rules)
     _print_server_group_details(cs, [server_group])
 
 
@@ -4679,33 +4653,6 @@ def do_version_list(cs, args):
 
     print(_("\nServer supported API versions:"))
     utils.print_list(result, columns)
-
-
-@api_versions.wraps("2.0", "2.11")
-def _print_virtual_interface_list(cs, interface_list):
-    columns = ['Id', 'Mac address']
-    utils.print_list(interface_list, columns)
-
-
-@api_versions.wraps("2.12")
-def _print_virtual_interface_list(cs, interface_list):
-    columns = ['Id', 'Mac address', 'Network ID']
-    formatters = {"Network ID": lambda o: o.net_id}
-    utils.print_list(interface_list, columns, formatters)
-
-
-@utils.arg('server', metavar='<server>', help=_('ID of server.'))
-def do_virtual_interface_list(cs, args):
-    """DEPRECATED Show virtual interface info about the given server."""
-    print(_('WARNING: Command virtual-interface-list is deprecated and will '
-            'be removed in the first major release after the Nova server '
-            '16.0.0 Pike release. There is no replacement or alternative for '
-            'this command. Specify --os-compute-api-version less than 2.44 '
-            'to continue using this command until it is removed.'),
-          file=sys.stderr)
-    server = _find_server(cs, args.server)
-    interface_list = cs.virtual_interfaces.list(base.getid(server))
-    _print_virtual_interface_list(cs, interface_list)
 
 
 @api_versions.wraps("2.26")
@@ -4830,6 +4777,23 @@ def _server_evacuate(cs, server, args):
                                                "error_message": error_message})
 
 
+def _hyper_servers(cs, host, strict):
+    hypervisors = cs.hypervisors.search(host, servers=True)
+    for hyper in hypervisors:
+        if strict and hyper.hypervisor_hostname != host:
+            continue
+        if hasattr(hyper, 'servers'):
+            for server in hyper.servers:
+                yield server
+        if strict:
+            break
+    else:
+        if strict:
+            msg = (_("No hypervisor matching '%s' could be found.") %
+                   host)
+            raise exceptions.NotFound(404, msg)
+
+
 @utils.arg('host', metavar='<host>',
            help='The hypervisor hostname (or pattern) to search for. '
                 'WARNING: Use a fully qualified domain name if you only '
@@ -4855,18 +4819,22 @@ def _server_evacuate(cs, server, args):
     default=False,
     help=_('Force to not verify the scheduler if a host is provided.'),
     start_version='2.29')
+@utils.arg(
+    '--strict',
+    dest='strict',
+    action='store_true',
+    default=False,
+    help=_('Evacuate host with exact hypervisor hostname match'))
 def do_host_evacuate(cs, args):
     """Evacuate all instances from failed host."""
-
-    hypervisors = cs.hypervisors.search(args.host, servers=True)
     response = []
-    for hyper in hypervisors:
-        if hasattr(hyper, 'servers'):
-            for server in hyper.servers:
-                response.append(_server_evacuate(cs, server, args))
-
-    utils.print_list(response,
-                     ["Server UUID", "Evacuate Accepted", "Error Message"])
+    for server in _hyper_servers(cs, args.host, args.strict):
+        response.append(_server_evacuate(cs, server, args))
+    utils.print_list(response, [
+        "Server UUID",
+        "Evacuate Accepted",
+        "Error Message",
+    ])
 
 
 def _server_live_migrate(cs, server, args):
@@ -4936,22 +4904,29 @@ def _server_live_migrate(cs, server, args):
     default=False,
     help=_('Force to not verify the scheduler if a host is provided.'),
     start_version='2.30')
+@utils.arg(
+    '--strict',
+    dest='strict',
+    action='store_true',
+    default=False,
+    help=_('live Evacuate host with exact hypervisor hostname match'))
 def do_host_evacuate_live(cs, args):
-    """Live migrate all instances of the specified host
+    """Live migrate all instances off the specified host
     to other available hosts.
     """
-    hypervisors = cs.hypervisors.search(args.host, servers=True)
     response = []
     migrating = 0
-    for hyper in hypervisors:
-        for server in getattr(hyper, 'servers', []):
-            response.append(_server_live_migrate(cs, server, args))
-            migrating += 1
-            if args.max_servers is not None and migrating >= args.max_servers:
-                break
-
-    utils.print_list(response, ["Server UUID", "Live Migration Accepted",
-                                "Error Message"])
+    for server in _hyper_servers(cs, args.host, args.strict):
+        response.append(_server_live_migrate(cs, server, args))
+        migrating = migrating + 1
+        if (args.max_servers is not None and
+                migrating >= args.max_servers):
+            break
+    utils.print_list(response, [
+        "Server UUID",
+        "Live Migration Accepted",
+        "Error Message",
+    ])
 
 
 class HostServersMigrateResponse(base.Resource):
@@ -4976,20 +4951,24 @@ def _server_migrate(cs, server):
            help='The hypervisor hostname (or pattern) to search for. '
                 'WARNING: Use a fully qualified domain name if you only '
                 'want to cold migrate from a specific host.')
+@utils.arg(
+    '--strict',
+    dest='strict',
+    action='store_true',
+    default=False,
+    help=_('Migrate host with exact hypervisor hostname match'))
 def do_host_servers_migrate(cs, args):
     """Cold migrate all instances off the specified host to other available
     hosts.
     """
-
-    hypervisors = cs.hypervisors.search(args.host, servers=True)
     response = []
-    for hyper in hypervisors:
-        if hasattr(hyper, 'servers'):
-            for server in hyper.servers:
-                response.append(_server_migrate(cs, server))
-
-    utils.print_list(response,
-                     ["Server UUID", "Migration Accepted", "Error Message"])
+    for server in _hyper_servers(cs, args.host, args.strict):
+        response.append(_server_migrate(cs, server))
+    utils.print_list(response, [
+        "Server UUID",
+        "Migration Accepted",
+        "Error Message",
+    ])
 
 
 @utils.arg(
@@ -5020,6 +4999,7 @@ def do_instance_action(cs, args):
     utils.print_dict(action)
 
 
+@api_versions.wraps("2.0", "2.57")
 @utils.arg(
     'server',
     metavar='<server>',
@@ -5040,6 +5020,56 @@ def do_instance_action_list(cs, args):
     actions = cs.instance_action.list(server)
     utils.print_list(actions,
                      ['Action', 'Request_ID', 'Message', 'Start_Time'],
+                     sortby_index=3)
+
+
+@api_versions.wraps("2.58")
+@utils.arg(
+    'server',
+    metavar='<server>',
+    help=_('Name or UUID of the server to list actions for. Only UUID can be '
+           'used to list actions on a deleted server.'))
+@utils.arg(
+    '--marker',
+    dest='marker',
+    metavar='<marker>',
+    default=None,
+    help=_('The last instance action of the previous page; displays list of '
+           'actions after "marker".'))
+@utils.arg(
+    '--limit',
+    dest='limit',
+    metavar='<limit>',
+    type=int,
+    default=None,
+    help=_('Maximum number of instance actions to display. Note that there '
+           'is a configurable max limit on the server, and the limit that is '
+           'used will be the minimum of what is requested here and what '
+           'is configured in the server.'))
+@utils.arg(
+    '--changes-since',
+    dest='changes_since',
+    metavar='<changes_since>',
+    default=None,
+    help=_('List only instance actions changed after a certain point of '
+           'time. The provided time should be an ISO 8061 formatted time. '
+           'e.g. 2016-03-04T06:27:59Z.'))
+def do_instance_action_list(cs, args):
+    """List actions on a server."""
+    server = _find_server(cs, args.server, raise_if_notfound=False)
+    if args.changes_since:
+        try:
+            timeutils.parse_isotime(args.changes_since)
+        except ValueError:
+            raise exceptions.CommandError(_('Invalid changes-since value: %s')
+                                          % args.changes_since)
+    actions = cs.instance_action.list(server, marker=args.marker,
+                                      limit=args.limit,
+                                      changes_since=args.changes_since)
+    # TODO(yikun): Output a "Marker" column if there is a next link?
+    utils.print_list(actions,
+                     ['Action', 'Request_ID', 'Message', 'Start_Time',
+                      'Updated_At'],
                      sortby_index=3)
 
 
@@ -5068,17 +5098,20 @@ def do_list_extensions(cs, _args):
     action='append',
     default=[],
     help=_('Metadata to set or delete (only key is necessary on delete)'))
+@utils.arg(
+    '--strict',
+    dest='strict',
+    action='store_true',
+    default=False,
+    help=_('Set host-meta to the hypervisor with exact hostname match'))
 def do_host_meta(cs, args):
     """Set or Delete metadata on all instances of a host."""
-    hypervisors = cs.hypervisors.search(args.host, servers=True)
-    for hyper in hypervisors:
+    for server in _hyper_servers(cs, args.host, args.strict):
         metadata = _extract_metadata(args)
-        if hasattr(hyper, 'servers'):
-            for server in hyper.servers:
-                if args.action == 'set':
-                    cs.servers.set_meta(server['uuid'], metadata)
-                elif args.action == 'delete':
-                    cs.servers.delete_meta(server['uuid'], metadata.keys())
+        if args.action == 'set':
+            cs.servers.set_meta(server['uuid'], metadata)
+        elif args.action == 'delete':
+            cs.servers.delete_meta(server['uuid'], metadata.keys())
 
 
 def _print_migrations(cs, migrations):
@@ -5097,6 +5130,10 @@ def _print_migrations(cs, migrations):
 
     formatters = {'Old Flavor': old_flavor, 'New Flavor': new_flavor}
 
+    # Insert migrations UUID after ID
+    if cs.api_version >= api_versions.APIVersion("2.59"):
+        fields.insert(0, "UUID")
+
     if cs.api_version >= api_versions.APIVersion("2.23"):
         fields.insert(0, "Id")
         fields.append("Type")
@@ -5105,6 +5142,7 @@ def _print_migrations(cs, migrations):
     utils.print_list(migrations, fields, formatters)
 
 
+@api_versions.wraps("2.0", "2.58")
 @utils.arg(
     '--instance-uuid',
     dest='instance_uuid',
@@ -5122,6 +5160,82 @@ def _print_migrations(cs, migrations):
     help=_('Fetch migrations for the given status.'))
 def do_migration_list(cs, args):
     """Print a list of migrations."""
-    migrations = cs.migrations.list(args.host, args.status, None,
+    migrations = cs.migrations.list(args.host, args.status,
                                     instance_uuid=args.instance_uuid)
     _print_migrations(cs, migrations)
+
+
+@api_versions.wraps("2.59")
+@utils.arg(
+    '--instance-uuid',
+    dest='instance_uuid',
+    metavar='<instance_uuid>',
+    help=_('Fetch migrations for the given instance.'))
+@utils.arg(
+    '--host',
+    dest='host',
+    metavar='<host>',
+    help=_('Fetch migrations for the given host.'))
+@utils.arg(
+    '--status',
+    dest='status',
+    metavar='<status>',
+    help=_('Fetch migrations for the given status.'))
+@utils.arg(
+    '--marker',
+    dest='marker',
+    metavar='<marker>',
+    default=None,
+    help=_('The last migration of the previous page; displays list of '
+           'migrations after "marker". Note that the marker is the '
+           'migration UUID.'))
+@utils.arg(
+    '--limit',
+    dest='limit',
+    metavar='<limit>',
+    type=int,
+    default=None,
+    help=_('Maximum number of migrations to display. Note that there is a '
+           'configurable max limit on the server, and the limit that is used '
+           'will be the minimum of what is requested here and what '
+           'is configured in the server.'))
+@utils.arg(
+    '--changes-since',
+    dest='changes_since',
+    metavar='<changes_since>',
+    default=None,
+    help=_('List only migrations changed after a certain point of time. '
+           'The provided time should be an ISO 8061 formatted time. '
+           'e.g. 2016-03-04T06:27:59Z .'))
+def do_migration_list(cs, args):
+    """Print a list of migrations."""
+    if args.changes_since:
+        try:
+            timeutils.parse_isotime(args.changes_since)
+        except ValueError:
+            raise exceptions.CommandError(_('Invalid changes-since value: %s')
+                                          % args.changes_since)
+
+    migrations = cs.migrations.list(args.host, args.status,
+                                    instance_uuid=args.instance_uuid,
+                                    marker=args.marker, limit=args.limit,
+                                    changes_since=args.changes_since)
+    # TODO(yikun): Output a "Marker" column if there is a next link?
+    _print_migrations(cs, migrations)
+
+
+@utils.arg(
+    '--before',
+    dest='before',
+    metavar='<before>',
+    default=None,
+    help=_("Filters the response by the date and time before which to list "
+           "usage audits. The date and time stamp format is as follows: "
+           "CCYY-MM-DD hh:mm:ss.NNNNNN ex 2015-08-27 09:49:58 or "
+           "2015-08-27 09:49:58.123456."))
+def do_instance_usage_audit_log(cs, args):
+    """List/Get server usage audits."""
+    audit_log = cs.instance_usage_audit_log.get(before=args.before).to_dict()
+    if 'hosts_not_run' in audit_log:
+        audit_log['hosts_not_run'] = pprint.pformat(audit_log['hosts_not_run'])
+    utils.print_dict(audit_log)

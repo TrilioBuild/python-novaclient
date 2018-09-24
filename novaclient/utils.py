@@ -12,15 +12,14 @@
 #    under the License.
 
 import contextlib
-import json
 import os
 import re
 import textwrap
 import time
-import uuid
 
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
+from oslo_utils import uuidutils
 import prettytable
 import six
 from six.moves.urllib import parse
@@ -118,43 +117,6 @@ def service_type(stype):
     return inner
 
 
-def add_resource_manager_extra_kwargs_hook(f, hook):
-    """Add hook to bind CLI arguments to ResourceManager calls.
-
-    The `do_foo` calls in shell.py will receive CLI args and then in turn pass
-    them through to the ResourceManager. Before passing through the args, the
-    hooks registered here will be called, giving us a chance to add extra
-    kwargs (taken from the command-line) to what's passed to the
-    ResourceManager.
-    """
-    if not hasattr(f, 'resource_manager_kwargs_hooks'):
-        f.resource_manager_kwargs_hooks = []
-
-    names = [h.__name__ for h in f.resource_manager_kwargs_hooks]
-    if hook.__name__ not in names:
-        f.resource_manager_kwargs_hooks.append(hook)
-
-
-def get_resource_manager_extra_kwargs(f, args, allow_conflicts=False):
-    """Return extra_kwargs by calling resource manager kwargs hooks."""
-    hooks = getattr(f, "resource_manager_kwargs_hooks", [])
-    extra_kwargs = {}
-    for hook in hooks:
-        hook_kwargs = hook(args)
-        hook_name = hook.__name__
-        conflicting_keys = set(hook_kwargs.keys()) & set(extra_kwargs.keys())
-        if conflicting_keys and not allow_conflicts:
-            msg = (_("Hook '%(hook_name)s' is attempting to redefine "
-                     "attributes '%(conflicting_keys)s'") %
-                   {'hook_name': hook_name,
-                    'conflicting_keys': conflicting_keys})
-            raise exceptions.NoUniqueMatch(msg)
-
-        extra_kwargs.update(hook_kwargs)
-
-    return extra_kwargs
-
-
 def pretty_choice_list(l):
     return ', '.join("'%s'" % i for i in l)
 
@@ -236,7 +198,7 @@ def flatten_dict(data):
     for key, value in data.items():
         if isinstance(value, six.string_types):
             try:
-                data[key] = json.loads(value)
+                data[key] = jsonutils.loads(value)
             except ValueError:
                 pass
 
@@ -293,9 +255,9 @@ def find_resource(manager, name_or_id, wrap_exception=True, **find_args):
         if six.PY3:
             tmp_id = tmp_id.decode()
 
-        uuid.UUID(tmp_id)
-        return manager.get(tmp_id)
-    except (TypeError, ValueError, exceptions.NotFound):
+        if uuidutils.is_uuid_like(tmp_id):
+            return manager.get(tmp_id)
+    except (TypeError, exceptions.NotFound):
         pass
 
     # then try to get entity as name
@@ -399,6 +361,18 @@ def safe_issubclass(*args):
     return False
 
 
+def _get_resource_string(resource):
+    if hasattr(resource, 'human_id') and resource.human_id:
+        if hasattr(resource, 'id') and resource.id:
+            return "%s (%s)" % (resource.human_id, resource.id)
+        else:
+            return resource.human_id
+    elif hasattr(resource, 'id') and resource.id:
+        return resource.id
+    else:
+        return resource
+
+
 def do_action_on_many(action, resources, success_msg, error_msg):
     """Helper to run an action on many resources."""
     failure_flag = False
@@ -406,7 +380,7 @@ def do_action_on_many(action, resources, success_msg, error_msg):
     for resource in resources:
         try:
             action(resource)
-            print(success_msg % resource)
+            print(success_msg % _get_resource_string(resource))
         except Exception as e:
             failure_flag = True
             print(encodeutils.safe_encode(six.text_type(e)))
@@ -454,5 +428,15 @@ def record_time(times, enabled, *args):
 
 def prepare_query_string(params):
     """Convert dict params to query string"""
+    # Transform the dict to a sequence of two-element tuples in fixed
+    # order, then the encoded string will be consistent in Python 2&3.
+    if not params:
+        return ''
     params = sorted(params.items(), key=lambda x: x[0])
     return '?%s' % parse.urlencode(params) if params else ''
+
+
+def get_url_with_filter(url, filters):
+    query_string = prepare_query_string(filters)
+    url = "%s%s" % (url, query_string)
+    return url
